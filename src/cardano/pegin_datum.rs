@@ -21,6 +21,7 @@
 
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::key::{Secp256k1, UntweakedPublicKey};
+use bitcoin::taproot::TaprootSpendInfo;
 use bitcoin::{Amount, ScriptBuf, Transaction, Txid};
 use pallas_primitives::PlutusData;
 
@@ -55,6 +56,11 @@ pub struct ParsedPegIn {
     /// beacon. Needed later to reconstruct the peg-in script tree for
     /// FROST-signing the TM input.
     pub depositor_xonly_pubkey: UntweakedPublicKey,
+    /// The peg-in `TaprootSpendInfo` derived during validation. Carried
+    /// out so callers building the TM input don't recompute (and risk
+    /// drifting from) the spend info this parse already proved matches
+    /// the on-chain scriptPubKey.
+    pub spend_info: TaprootSpendInfo,
 }
 
 #[derive(Debug)]
@@ -219,6 +225,7 @@ pub fn parse_pegin_request(
         value: txout.value,
         cardano_utxo: req.cardano_utxo.clone(),
         depositor_xonly_pubkey,
+        spend_info,
     })
 }
 

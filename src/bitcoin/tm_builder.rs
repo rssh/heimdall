@@ -314,6 +314,40 @@ pub fn compute_sighashes(unsigned_tm: &UnsignedTm) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Sign every input of a key-path-spend TM with a **single** secret key,
+/// applying each input's BIP-341 taptweak (`input_spend_info[i].merkle_root()`).
+///
+/// In the demo the treasury and all peg-in deposits are key-pathed on the same
+/// federation key (`Y_fed` = `Y_51`), so one `secret` signs every input; each
+/// input is still tweaked with its own script-tree merkle root. Returns the
+/// witnessed transaction. A `secret` that does not match an input's internal key
+/// produces a signature that won't validate under that input's output key — the
+/// caller should verify before broadcasting.
+pub fn sign_tm_single_key(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    unsigned: &UnsignedTm,
+    secret: &bitcoin::secp256k1::SecretKey,
+) -> Transaction {
+    use bitcoin::key::TapTweak;
+    use bitcoin::secp256k1::{Keypair, Message};
+
+    let sighashes = compute_sighashes(unsigned);
+    let keypair = Keypair::from_secret_key(secp, secret);
+    let mut tx = unsigned.tx.clone();
+    for (i, txin) in tx.input.iter_mut().enumerate() {
+        let merkle_root = unsigned.input_spend_info[i].merkle_root();
+        let tweaked = keypair.tap_tweak(secp, merkle_root);
+        let msg = Message::from_digest(sighashes[i]);
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
+        let tap_sig = bitcoin::taproot::Signature {
+            signature: sig,
+            sighash_type: TapSighashType::Default,
+        };
+        txin.witness = Witness::p2tr_key_spend(&tap_sig);
+    }
+    tx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +412,47 @@ mod tests {
         let secp = Secp256k1::new();
         let key = xonly_from_seed([0xFFu8; 32]);
         ScriptBuf::new_p2tr(&secp, key, None)
+    }
+
+    /// Secret key matching `xonly_from_seed(seed)` (both hash the seed first).
+    fn sk_from_seed(seed: [u8; 32]) -> bitcoin::secp256k1::SecretKey {
+        use bitcoin::hashes::{sha256, Hash as _};
+        bitcoin::secp256k1::SecretKey::from_slice(sha256::Hash::hash(&seed).as_ref()).unwrap()
+    }
+
+    // --- Single-key signer ---
+
+    #[test]
+    fn test_single_key_signer_verifies_under_output_key() {
+        let secp = Secp256k1::new();
+        // The test treasury/peg-in spend infos use internal key y_51 = xonly_from_seed([1;32]).
+        let sk = sk_from_seed([1u8; 32]);
+        assert_eq!(sk.x_only_public_key(&secp).0, xonly_from_seed([1u8; 32]));
+
+        let fee_params = default_fee_params();
+        let tm = build_tm(
+            make_treasury_input(0xAA, 1_000_000),
+            vec![make_pegin_input(0xBB, 0, 500_000)],
+            vec![],
+            change_address(),
+            &fee_params,
+        )
+        .unwrap();
+
+        let signed = sign_tm_single_key(&secp, &tm, &sk);
+        let sighashes = compute_sighashes(&tm);
+
+        assert_eq!(signed.input.len(), 2);
+        for (i, txin) in signed.input.iter().enumerate() {
+            let items = txin.witness.to_vec();
+            assert_eq!(items.len(), 1, "input {i}: key-path witness is one element");
+            assert_eq!(items[0].len(), 64, "input {i}: Default-sighash sig is 64 bytes");
+            let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&items[0]).unwrap();
+            let msg = bitcoin::secp256k1::Message::from_digest(sighashes[i]);
+            let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
+            secp.verify_schnorr(&sig, &msg, &outkey)
+                .unwrap_or_else(|e| panic!("input {i} sig invalid under output key: {e}"));
+        }
     }
 
     // --- Determinism ---

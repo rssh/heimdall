@@ -1,4 +1,9 @@
 /target
 .direnv/
 .env
+.venv/
 docs/local/
+# Bitcoin WIF private keys for the demo depositors — never commit.
+/.keys/
+# Generated peg-in demo output.
+/data/
