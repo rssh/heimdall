@@ -335,8 +335,11 @@ async fn build_tm_phase(
     );
     let change_script = bitcoin::ScriptBuf::new_p2tr_tweaked(change_spend.output_key());
 
-    // TODO: real peg-ins use `pegin_spend_info(...)` with a per-depositor
-    // pubkey hash + refund timeout, not the treasury script tree.
+    // Each peg-in input is locked under its own per-depositor peg-in script
+    // tree (internal key Y_fed + refund leaf), NOT the treasury tree. Reuse the
+    // `TaprootSpendInfo` `parse_pegin_request` already proved matches the
+    // on-chain deposit scriptPubKey, so the TM sighash commits to the correct
+    // prevout and the signature validates.
     let pegin_inputs: Vec<PegInInput> = frozen_pegins
         .into_iter()
         .map(|p| PegInInput {
@@ -345,12 +348,7 @@ async fn build_tm_phase(
                 vout: p.btc_vout,
             },
             value: p.value,
-            spend_info: treasury_spend_info(
-                &secp,
-                treasury.y_51,
-                treasury.y_fed,
-                treasury.federation_csv_blocks as u16,
-            ),
+            spend_info: p.spend_info,
         })
         .collect();
 

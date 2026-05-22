@@ -74,6 +74,7 @@ pub enum TmBuildError {
     InsufficientFunds { available: Amount, required: Amount },
     NoPegOutAmountAfterFee { index: usize, amount: Amount, fee: Amount },
     DustOutput { index: usize, value: Amount },
+    MalformedUnsignedTm { inputs: usize, prevouts: usize, spend_infos: usize },
 }
 
 impl fmt::Display for TmBuildError {
@@ -88,6 +89,11 @@ impl fmt::Display for TmBuildError {
             Self::DustOutput { index, value } => {
                 write!(f, "output [{index}] value {value} below dust threshold")
             }
+            Self::MalformedUnsignedTm { inputs, prevouts, spend_infos } => write!(
+                f,
+                "malformed UnsignedTm: {inputs} inputs but {prevouts} prevouts \
+                 and {spend_infos} spend infos (all must match)"
+            ),
         }
     }
 }
@@ -260,9 +266,11 @@ pub fn build_tm(
     let mut outputs = Vec::with_capacity(num_outputs);
 
     let change_value = total_input.checked_sub(required).expect("checked above");
-    // Change can be zero only if there's nothing left — but that would mean
-    // the treasury is empty. Allow dust-or-above change, error on sub-dust non-zero.
-    if change_value > Amount::ZERO && change_value < DUST_THRESHOLD {
+    // output[0] is always the new treasury, so it must carry a spendable
+    // balance. Reject any sub-dust value, including zero (which would mean the
+    // inputs exactly covered fee+peg-outs and left nothing for the treasury) —
+    // a zero/dust output[0] is non-standard and would be rejected on broadcast.
+    if change_value < DUST_THRESHOLD {
         return Err(TmBuildError::DustOutput {
             index: 0,
             value: change_value,
@@ -323,13 +331,26 @@ pub fn compute_sighashes(unsigned_tm: &UnsignedTm) -> Vec<[u8; 32]> {
 /// witnessed transaction. A `secret` that does not match an input's internal key
 /// produces a signature that won't validate under that input's output key — the
 /// caller should verify before broadcasting.
+///
+/// Returns [`TmBuildError::MalformedUnsignedTm`] if the input/prevout/spend-info
+/// counts disagree (e.g. a hand-constructed `UnsignedTm`); a TM built by
+/// [`build_tm`] always satisfies the invariant.
 pub fn sign_tm_single_key(
     secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
     unsigned: &UnsignedTm,
     secret: &bitcoin::secp256k1::SecretKey,
-) -> Transaction {
+) -> Result<Transaction, TmBuildError> {
     use bitcoin::key::TapTweak;
     use bitcoin::secp256k1::{Keypair, Message};
+
+    let n = unsigned.tx.input.len();
+    if unsigned.prevouts.len() != n || unsigned.input_spend_info.len() != n {
+        return Err(TmBuildError::MalformedUnsignedTm {
+            inputs: n,
+            prevouts: unsigned.prevouts.len(),
+            spend_infos: unsigned.input_spend_info.len(),
+        });
+    }
 
     let sighashes = compute_sighashes(unsigned);
     let keypair = Keypair::from_secret_key(secp, secret);
@@ -345,7 +366,7 @@ pub fn sign_tm_single_key(
         };
         txin.witness = Witness::p2tr_key_spend(&tap_sig);
     }
-    tx
+    Ok(tx)
 }
 
 #[cfg(test)]
@@ -439,7 +460,7 @@ mod tests {
         )
         .unwrap();
 
-        let signed = sign_tm_single_key(&secp, &tm, &sk);
+        let signed = sign_tm_single_key(&secp, &tm, &sk).unwrap();
         let sighashes = compute_sighashes(&tm);
 
         assert_eq!(signed.input.len(), 2);

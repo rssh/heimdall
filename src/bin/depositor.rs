@@ -90,9 +90,12 @@ struct Cli {
     #[arg(long, default_value_t = 1000)]
     fee_sat: u64,
 
-    /// Skip broadcast even if `bitcoin.submit = true` in config.
+    /// Broadcast the signed tx to `bitcoin.rpc_url`. Opt-in: without this flag
+    /// the depositor only prints the raw tx / txid (dry run). This is a demo
+    /// tool, so it does NOT inherit the daemon's `bitcoin.submit` setting —
+    /// broadcasting a live peg-in requires explicit intent here.
     #[arg(long)]
-    no_submit: bool,
+    submit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,10 +127,11 @@ fn run() -> Result<(), String> {
     let depositor_priv =
         PrivateKey::from_wif(wif.trim()).map_err(|e| format!("invalid depositor WIF: {e}"))?;
     if depositor_priv.network != network.into() {
-        eprintln!(
-            "warning: WIF network ({:?}) differs from config network ({:?})",
+        return Err(format!(
+            "WIF network ({:?}) differs from config network ({:?}); the derived \
+             funding address would not match the key on the configured network",
             depositor_priv.network, network
-        );
+        ));
     }
     let depositor_sk = depositor_priv.inner;
     let depositor_compressed = CompressedPublicKey::from_private_key(&secp, &depositor_priv)
@@ -144,6 +148,17 @@ fn run() -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
 
     let deposit_amount = Amount::from_sat(cli.deposit_amount_sat);
+    // The federation rejects peg-in outputs below its 330-sat dust threshold
+    // (see parse_pegin_request); building one would strand the BTC until the
+    // refund timelock, so reject it up front.
+    const PEGIN_DUST_SAT: u64 = 330;
+    if cli.deposit_amount_sat < PEGIN_DUST_SAT {
+        return Err(format!(
+            "--deposit-amount-sat {} is below the {}-sat peg-in dust threshold the \
+             federation enforces; the deposit would be unprocessable",
+            cli.deposit_amount_sat, PEGIN_DUST_SAT
+        ));
+    }
 
     let (selected, fee) = match cli.funding_txid.as_deref() {
         Some(txid_hex) => {
@@ -168,7 +183,9 @@ fn run() -> Result<(), String> {
                     "no UTXOs found at {depositor_p2wpkh}. Fund the address and retry."
                 ));
             }
-            let required = Amount::from_sat(cli.deposit_amount_sat + cli.fee_sat);
+            let required = deposit_amount
+                .checked_add(Amount::from_sat(cli.fee_sat))
+                .ok_or_else(|| "deposit + fee overflows".to_string())?;
             let selected = select_utxos(&utxos, required)?;
             let extra = selected.len().saturating_sub(1) as u64;
             let fee = Amount::from_sat(cli.fee_sat + extra * EXTRA_INPUT_FEE_SAT);
@@ -202,6 +219,20 @@ fn run() -> Result<(), String> {
             )
         })?;
 
+    // A zero or sub-dust P2WPKH change output is non-standard and bitcoind
+    // rejects it on broadcast. Demo tooling: rather than silently absorbing the
+    // remainder into the fee, fail loudly so the operator picks a different
+    // amount / funding UTXO.
+    const P2WPKH_DUST_SAT: u64 = 294;
+    if change > Amount::ZERO && change < Amount::from_sat(P2WPKH_DUST_SAT) {
+        return Err(format!(
+            "change {} sat is below the P2WPKH dust threshold ({} sat); \
+             adjust --deposit-amount-sat / --fee-sat or fund a larger UTXO",
+            change.to_sat(),
+            P2WPKH_DUST_SAT
+        ));
+    }
+
     let pegin_spk = pegin_addr.script_pubkey();
     let beacon_spk = build_beacon_spk(depositor_xonly.serialize());
     let change_spk = ScriptBuf::new_p2wpkh(&depositor_compressed.wpubkey_hash());
@@ -220,24 +251,31 @@ fn run() -> Result<(), String> {
         })
         .collect();
 
+    let mut outputs = vec![
+        TxOut {
+            value: deposit_amount,
+            script_pubkey: pegin_spk,
+        },
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: beacon_spk,
+        },
+    ];
+    // Omit the change output entirely when the remainder is zero (a zero-value
+    // P2WPKH output is non-standard); sub-dust positive change was already
+    // rejected above.
+    if change > Amount::ZERO {
+        outputs.push(TxOut {
+            value: change,
+            script_pubkey: change_spk,
+        });
+    }
+
     let mut tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: inputs,
-        output: vec![
-            TxOut {
-                value: deposit_amount,
-                script_pubkey: pegin_spk,
-            },
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: beacon_spk,
-            },
-            TxOut {
-                value: change,
-                script_pubkey: change_spk,
-            },
-        ],
+        output: outputs,
     };
 
     for (idx, utxo) in selected.iter().enumerate() {
@@ -248,13 +286,12 @@ fn run() -> Result<(), String> {
     println!("{}", hex::encode(&raw));
     eprintln!("txid: {}", tx.compute_txid());
 
-    let should_submit = cfg.bitcoin.submit && !cli.no_submit;
-    if should_submit {
+    if cli.submit {
         let rpc = build_rpc(&cfg)?;
         rt.block_on(broadcast_btc_tx(&rpc, &raw))
             .map_err(|e| format!("broadcast failed: {e}"))?;
     } else {
-        eprintln!("(skipped broadcast — submit=false or --no-submit)");
+        eprintln!("(dry run — pass --submit to broadcast)");
     }
 
     Ok(())
@@ -475,6 +512,12 @@ async fn scan_utxos(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, Stri
 /// (e.g. -18 "No wallet is loaded"), so this helper does NOT treat a
 /// JSON-level error as fatal — callers inspect `json["error"]` to decide
 /// whether a given code is recoverable (see `list_unspent`).
+///
+/// Demo-only: this builds a fresh `reqwest::Client` per call (no connection
+/// pooling) and assumes the response body is JSON, so an auth failure (HTTP
+/// 401/403, non-JSON body) surfaces as a generic `rpc parse` error rather than
+/// a precise diagnostic. Acceptable for the depositor test-utility; a
+/// production RPC client would reuse one `Client` and branch on `resp.status()`.
 async fn rpc_call(
     rpc: &BtcRpcConfig,
     body: serde_json::Value,

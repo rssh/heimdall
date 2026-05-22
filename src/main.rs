@@ -552,6 +552,20 @@ fn parse_outpoint(s: &str) -> Result<bitcoin::OutPoint, String> {
         .map_err(|e| format!("outpoint must be <txid>:<vout>, got '{s}': {e}"))
 }
 
+/// Narrow the configured federation CSV timelock to `u16` (the width required
+/// by the relative-timelock encoding). Errors if the value exceeds `u16::MAX`,
+/// since a silent truncation would change the Taproot spend path and produce an
+/// invalid scriptPubKey / signatures.
+fn csv_blocks_u16(cfg: &HeimdallConfig) -> Result<u16, String> {
+    u16::try_from(cfg.bitcoin.federation_csv_blocks).map_err(|_| {
+        format!(
+            "federation_csv_blocks ({}) exceeds u16::MAX ({})",
+            cfg.bitcoin.federation_csv_blocks,
+            u16::MAX
+        )
+    })
+}
+
 /// Build `FeeParams` from the Bitcoin config section.
 fn fee_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::FeeParams {
     heimdall::bitcoin::tm_builder::FeeParams {
@@ -592,7 +606,7 @@ fn run_treasury_self_send(
     let secp = Secp256k1::new();
     let outpoint = parse_outpoint(outpoint)?;
     let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
-    let csv = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv = csv_blocks_u16(cfg)?;
 
     let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
     let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
@@ -611,7 +625,8 @@ fn run_treasury_self_send(
     )
     .map_err(|e| format!("build self-send: {e}"))?;
 
-    let signed = sign_tm_single_key(&secp, &unsigned, &sk);
+    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
+        .map_err(|e| format!("sign self-send: {e}"))?;
     let raw = bitcoin::consensus::encode::serialize(&signed);
 
     println!("self-send txid : {}", signed.compute_txid());
@@ -662,7 +677,7 @@ fn run_sweep_pegins(
 
     let secp = Secp256k1::new();
     let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
-    let csv = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv = csv_blocks_u16(cfg)?;
     let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
 
     let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
@@ -734,7 +749,8 @@ fn run_sweep_pegins(
         ));
     }
 
-    let signed = sign_tm_single_key(&secp, &unsigned, &sk);
+    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
+        .map_err(|e| format!("sign sweep: {e}"))?;
     let raw = bitcoin::consensus::encode::serialize(&signed);
 
     println!("\n── Treasury Movement (sweep peg-ins) ──");
@@ -797,7 +813,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     .unwrap();
 
     let network = cfg.bitcoin.parsed_network();
-    let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv_blocks = csv_blocks_u16(cfg).unwrap_or_else(|e| panic!("{e}"));
 
     // At bootstrap Y_51 = Y_fed.
     let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv_blocks);
@@ -819,7 +835,7 @@ fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) {
 
     let secp = Secp256k1::new();
     let network = cfg.bitcoin.parsed_network();
-    let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv_blocks = csv_blocks_u16(cfg).unwrap_or_else(|e| panic!("{e}"));
 
     let hex_str = frost_key_hex.expect("--frost-key <32-byte-hex> is required");
     let bytes: Vec<u8> = hex::decode(hex_str).expect("--frost-key must be valid hex");

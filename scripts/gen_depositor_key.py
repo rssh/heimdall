@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate a fresh P2WPKH WIF + address for a chosen Bitcoin network.
 
-Used to bootstrap a depositor key for the heimdall peg-in flow.
-See docs/local/instructions/peg-in.md.
+Demo-only tooling: bootstraps a depositor key for the heimdall peg-in flow.
+See the sibling scripts put_pegin_alice.sh / put_pegin_bob.sh for how the
+generated WIF is fed to the `depositor` binary.
 
 Requires python-bitcoinlib in a venv:
     python3 -m venv .venv
