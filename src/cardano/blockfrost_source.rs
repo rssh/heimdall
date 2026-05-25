@@ -21,8 +21,12 @@ impl BlockfrostPegInSource {
     /// `project_id` is the Blockfrost API key (e.g. `preprodXXXXXX`).
     /// The network is auto-detected from the key prefix. `address` is
     /// the bech32 script address carrying peg-in UTxOs.
-    pub fn new(project_id: &str, address: impl Into<String>) -> Self {
-        let api = BlockfrostAPI::new(project_id, BlockFrostSettings::new());
+    pub fn new(project_id: &str, address: impl Into<String>, blockfrost_url: Option<&str>) -> Self {
+        let mut settings = BlockFrostSettings::new();
+        if let Some(url) = blockfrost_url {
+            settings.base_url = Some(url.to_string());
+        }
+        let api = BlockfrostAPI::new(project_id, settings);
         Self {
             api,
             address: address.into(),

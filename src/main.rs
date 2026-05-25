@@ -468,7 +468,11 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
 
         chain = Arc::new(bf_chain);
-        pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
+        pegin_source = Arc::new(BlockfrostPegInSource::new(
+            project_id,
+            &script_address,
+            cfg.cardano.blockfrost_url.as_deref(),
+        ));
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
         let magic = cfg
             .cardano
@@ -732,6 +736,7 @@ fn run_sweep_pegins(
     use bitcoin::{Amount, OutPoint, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, PegInInput, TreasuryInput};
+    use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
     use heimdall::cardano::btc_rpc::broadcast_btc_tx;
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
     use heimdall::cardano::pegin_datum::parse_pegin_request;
@@ -747,12 +752,28 @@ fn run_sweep_pegins(
         .try_into()
         .map_err(|_| "pegin_policy_id must be 28 bytes (56 hex chars)".to_string())?;
 
-    // One runtime for both the N2C scan and the (optional) broadcast.
+    // One runtime for both the peg-in scan and the (optional) broadcast.
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
 
-    let source =
-        PallasPegInSource::from_bech32(cardano_socket, NetworkMagic(cardano_magic), pegin_script_address)
-            .map_err(|e| format!("pallas source: {e}"))?;
+    // Scan PegInRequests: via Blockfrost (incl. yaci-devkit's blockfrost_url) when configured,
+    // else via the N2C socket.
+    let source: Box<dyn CardanoPegInSource> =
+        if let Some(pid) = cfg.cardano.blockfrost_project_id.as_deref() {
+            Box::new(BlockfrostPegInSource::new(
+                pid,
+                pegin_script_address,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        } else {
+            Box::new(
+                PallasPegInSource::from_bech32(
+                    cardano_socket,
+                    NetworkMagic(cardano_magic),
+                    pegin_script_address,
+                )
+                .map_err(|e| format!("pallas source: {e}"))?,
+            )
+        };
     let reqs = rt
         .block_on(source.query_pegin_requests(&policy_id))
         .map_err(|e| format!("query_pegin_requests: {e}"))?;
