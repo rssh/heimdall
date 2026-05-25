@@ -144,6 +144,14 @@ pub struct CardanoConfig {
     /// 0 = unconfirmed TM tx (Binocular will update to 1 on Bitcoin confirmation).
     /// Default: 0.
     pub oracle_constructor: u8,
+    /// TreasuryMovementValidator CBOR (from `binocular tm-script`). When set (with
+    /// `tm_control_ref`), the TM NFT is minted under the real validator policy — then
+    /// `treasury_policy_id` must be the validator's script hash and `treasury_asset_name` empty.
+    /// When unset, the always-ok scaffold policy is used.
+    pub tm_script_cbor: Option<String>,
+    /// The TM-control UTxO outpoint `<tx_hash>#<index>` to reference (carries the authorized-minter
+    /// datum). Required alongside `tm_script_cbor`.
+    pub tm_control_ref: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -160,6 +168,8 @@ impl Default for CardanoConfig {
             mnemonic: None,
             submit_oracle: true,
             oracle_constructor: 0,
+            tm_script_cbor: None,
+            tm_control_ref: None,
         }
     }
 }

@@ -52,6 +52,13 @@ treasury_asset_name = "544d5478"
 # Setting mnemonic here would override the env var.
 submit_oracle = true   # publish oracle-update UTxO to Cardano after signing
 oracle_constructor = 0 # 0 = unconfirmed TM tx (Binocular sets 1 on BTC confirmation)
+# To mint the TM NFT under the REAL TreasuryMovementValidator policy (instead of the always-ok
+# scaffold), set both of the following (from `binocular tm-script` + `binocular deploy-bridge`), AND
+# change treasury_policy_id above to the validator's script hash (the `policy_id` tm-script prints,
+# == treasury_address credential) and treasury_asset_name to "" (the validator counts the empty-name
+# token). publish.rs then references the control UTxO + signs with the authorized (wallet) key.
+# tm_script_cbor = "<cbor from `binocular tm-script`>"
+# tm_control_ref = "<control-utxo tx_hash>#<index>"   # the TM-control UTxO from deploy-bridge
 
 [http]
 bind_address = "127.0.0.1"

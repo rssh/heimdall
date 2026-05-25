@@ -368,6 +368,28 @@ fn main() {
     }
 }
 
+/// Apply the real TM-NFT minting policy to the chain when both `cardano.tm_script_cbor` and
+/// `cardano.tm_control_ref` are configured (else leave it on the always-ok scaffold). Errors on a
+/// half-configured pair or a malformed control ref (`<tx_hash>#<index>`).
+fn apply_tm_policy(
+    chain: BlockfrostCardanoChain,
+    cfg: &HeimdallConfig,
+) -> Result<BlockfrostCardanoChain, String> {
+    match (&cfg.cardano.tm_script_cbor, &cfg.cardano.tm_control_ref) {
+        (Some(cbor), Some(r)) => {
+            let (h, i) = r
+                .split_once('#')
+                .and_then(|(h, i)| i.parse::<u32>().ok().map(|i| (h, i)))
+                .ok_or_else(|| {
+                    format!("cardano.tm_control_ref must be <tx_hash>#<index>, got '{r}'")
+                })?;
+            Ok(chain.with_tm_policy(cbor, h, i))
+        }
+        (None, None) => Ok(chain),
+        _ => Err("set both cardano.tm_script_cbor and cardano.tm_control_ref (or neither)".into()),
+    }
+}
+
 async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     let id = Identifier::try_from(index).unwrap();
 
@@ -442,6 +464,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+        let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
 
         chain = Arc::new(bf_chain);
         pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
@@ -877,6 +900,7 @@ fn run_sweep_pegins(
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+        let chain = apply_tm_policy(chain, cfg)?;
         rt.block_on(chain.submit_signed_tm(&raw))
             .map_err(|e| format!("submit_signed_tm: {e}"))?;
         return Ok(());

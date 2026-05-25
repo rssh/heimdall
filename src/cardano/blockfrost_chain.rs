@@ -61,6 +61,13 @@ pub struct BlockfrostCardanoChain {
     submit_oracle: bool,
     /// Constructor tag used in the oracle datum (0 = unconfirmed, 1 = confirmed).
     oracle_constructor: u8,
+    /// TreasuryMovementValidator CBOR (`binocular tm-script`). When set, the TM NFT is minted under
+    /// this policy (and `treasury_policy_id` must be its hash, `treasury_asset_name_hex` empty); else
+    /// the always-ok scaffold is used.
+    tm_script_cbor: Option<String>,
+    /// The TM-control UTxO `(tx_hash, index)` to reference so the validator can read the authorized
+    /// minter. Required alongside `tm_script_cbor`.
+    tm_control_ref: Option<(String, u32)>,
 }
 
 impl BlockfrostCardanoChain {
@@ -87,7 +94,18 @@ impl BlockfrostCardanoChain {
             submit_btc: true,
             submit_oracle: true,
             oracle_constructor: 0,
+            tm_script_cbor: None,
+            tm_control_ref: None,
         }
+    }
+
+    /// Mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
+    /// `binocular tm-script`), referencing the TM-control UTxO `(tx_hash, index)`. Without this the
+    /// always-ok scaffold policy is used.
+    pub fn with_tm_policy(mut self, script_cbor: &str, control_tx_hash: &str, control_index: u32) -> Self {
+        self.tm_script_cbor = Some(script_cbor.to_string());
+        self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
+        self
     }
 
     /// Override submission flags from config.
@@ -328,6 +346,10 @@ impl CardanoChain for BlockfrostCardanoChain {
             self.oracle_constructor,
             &wallet_utxos,
             key,
+            self.tm_script_cbor.as_deref(),
+            self.tm_control_ref
+                .as_ref()
+                .map(|(h, i)| (h.as_str(), *i)),
         )?;
 
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)

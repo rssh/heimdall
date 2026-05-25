@@ -80,6 +80,13 @@ pub fn build_oracle_update_tx(
     constructor: u8,
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
+    // When `Some`, mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
+    // `binocular tm-script`) and reference the TM-control UTxO `(tx_hash, index)` so the validator
+    // can read the authorized minter. `treasury_policy_id` must then be the validator's script hash
+    // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
+    // falls back to the always-ok scaffold policy (legacy).
+    tm_script_cbor: Option<&str>,
+    control_ref: Option<(&str, u32)>,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
@@ -139,7 +146,17 @@ pub fn build_oracle_update_tx(
         change_address: wallet_address.to_string(),
         signing_key: vec![],
         network: Some(whisky::Network::Preprod),
-        reference_inputs: vec![],
+        // Reference the TM-control UTxO so the validator's mint branch can read the authorized
+        // minter from its datum (authenticated by the control NFT it carries).
+        reference_inputs: control_ref
+            .map(|(h, i)| {
+                vec![RefTxIn {
+                    tx_hash: h.to_string(),
+                    tx_index: i,
+                    script_size: None,
+                }]
+            })
+            .unwrap_or_default(),
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
             mint: MintParameter {
@@ -155,7 +172,7 @@ pub fn build_oracle_update_tx(
                 },
             }),
             script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: ALWAYS_OK_PLUTUS_CBOR_HEX.to_string(),
+                script_cbor: tm_script_cbor.unwrap_or(ALWAYS_OK_PLUTUS_CBOR_HEX).to_string(),
                 language_version: LanguageVersion::V3,
             })),
         })],
