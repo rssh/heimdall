@@ -154,6 +154,12 @@ enum Commands {
         #[arg(long)]
         broadcast: bool,
     },
+    /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
+    /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
+    WalletAddress {
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
     /// discovered deposits into a new treasury output[0]. Key-path spend signed
@@ -300,6 +306,38 @@ fn main() {
             if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Commands::WalletAddress { config } => {
+            let cfg = load_config(config.as_deref());
+            let mnemonic = cfg
+                .cardano
+                .mnemonic
+                .clone()
+                .or_else(|| {
+                    std::env::var("HEIMDALL_MNEMONIC")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("Error: no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)");
+                    std::process::exit(1);
+                });
+            match (
+                heimdall::cardano::wallet::wallet_address_from_mnemonic(&mnemonic),
+                heimdall::cardano::wallet::derive_payment_key(&mnemonic),
+            ) {
+                (Ok(addr), Ok(key)) => {
+                    println!("wallet base address: {addr}");
+                    println!(
+                        "payment key hash:    {}",
+                        heimdall::cardano::wallet::pub_key_hash_hex(&key)
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Commands::SweepPegins {

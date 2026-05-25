@@ -37,11 +37,13 @@ blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # network_magic = 1
 # pegin_script_address = "addr_test1..."
 # pegin_policy_id = "abcdef..."
-# TM UTxO address = binocular's TreasuryMovementValidator, parameterized by the oracle script hash
-# (7ba9aae06f9b3e9810bc469b9b6a4e60fcf0d405075f9427f8ddbe17 → TM script hash
-# 224736fb95b955718a0e3647b5d89931f543f89c1d34f43047934157). The Unconfirmed TM UTxO posted here is
-# what `binocular confirm-tmtx` validates + spends. Re-derive with `binocular info` after an oracle
-# or validator change. (Was the old always-ok TmtxScript scaffold addr_test1wr40m3xe…)
+# TM UTxO address = binocular's TreasuryMovementValidator, now parameterized by
+# (oracle script hash, TM-control NFT policy, TM-control NFT name). STALE/PLACEHOLDER: the value
+# below was for the earlier authority-pkh-param version; the validator was refactored so the
+# authorized minter lives in an NFT-authenticated control datum (address no longer depends on any
+# key). TODO: deploy the TM-control one-shot NFT + control UTxO, set binocular
+# bridge.tm-control-nft-{policy,name}, then `binocular info` prints the real TM address — paste it
+# here. Until then this address is wrong and confirm-tmtx/relay will not find the UTxO.
 treasury_address = "addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu"
 # Marker token (identity NFT riding Unconfirmed→Confirmed); always-ok policy, minted by publish.rs.
 treasury_policy_id = "eafdc4d9733275d3e06cfe5fe54a13fff3ba5baa8d65636260537907"
