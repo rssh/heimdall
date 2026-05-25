@@ -61,6 +61,9 @@ pub struct BlockfrostCardanoChain {
     submit_oracle: bool,
     /// Constructor tag used in the oracle datum (0 = unconfirmed, 1 = confirmed).
     oracle_constructor: u8,
+    /// Resolved Blockfrost base URL + project id, for raw-HTTP UTxO queries (lenient parsing).
+    bf_base_url: String,
+    bf_project_id: String,
     /// TreasuryMovementValidator CBOR (`binocular tm-script`). When set, the TM NFT is minted under
     /// this policy (and `treasury_policy_id` must be its hash, `treasury_asset_name_hex` empty); else
     /// the always-ok scaffold is used.
@@ -89,6 +92,8 @@ impl BlockfrostCardanoChain {
         let api = BlockfrostAPI::new(project_id, settings);
         Self {
             api,
+            bf_base_url: crate::cardano::bf_http::base_url(project_id, blockfrost_url),
+            bf_project_id: project_id.to_string(),
             treasury_address: treasury_address.into(),
             treasury_policy_id: treasury_policy_id.into(),
             treasury_asset_name_hex: treasury_asset_name_hex.into(),
@@ -160,22 +165,11 @@ impl BlockfrostCardanoChain {
             .as_deref()
             .ok_or_else(|| EpochError::Chain("no wallet address — was with_mnemonic called?".into()))?;
 
-        let utxos = match self
-            .api
-            .addresses_utxos(wallet_addr, Pagination::all())
-            .await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("404") || msg.contains("Not Found") {
-                    return Ok(vec![]);
-                }
-                return Err(EpochError::Chain(format!(
-                    "blockfrost wallet UTxO query: {e}"
-                )));
-            }
-        };
+        // Raw HTTP + lenient parse (tolerates backends like yaci-devkit that omit `tx_index`).
+        let utxos =
+            crate::cardano::bf_http::fetch_address_utxos(&self.bf_base_url, &self.bf_project_id, wallet_addr)
+                .await
+                .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
         Ok(utxos
             .iter()
@@ -188,7 +182,7 @@ impl BlockfrostCardanoChain {
                     .unwrap_or(0);
                 WalletUtxo {
                     tx_hash: u.tx_hash.clone(),
-                    output_index: u.output_index as u32,
+                    output_index: u.output_index,
                     lovelace,
                 }
             })

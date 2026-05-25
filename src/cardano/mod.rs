@@ -10,6 +10,7 @@
 //! a one-line change at the demo entry point.
 
 pub mod always_ok;
+pub mod bf_http;
 pub mod blockfrost_chain;
 pub mod btc_rpc;
 pub mod blockfrost_source;

@@ -107,8 +107,11 @@ pub fn build_oracle_update_tx(
             EpochError::Chain("no wallet UTxO with >= 5 ADA for collateral".into())
         })?;
 
-    // Min-UTxO for the oracle output with inline datum + token (~2 ADA).
-    let oracle_lovelace = 2_000_000u64;
+    // Min-UTxO scales with output size — the inline datum carries the whole signed BTC tx, so a
+    // flat 2 ADA is too small (BabbageOutputTooSmallUTxO). Approximate Conway min-UTxO
+    // (coinsPerUTxOByte = 4310) generously from the datum size, with a 2-ADA floor.
+    let datum_bytes = (datum_hex.len() / 2) as u64;
+    let oracle_lovelace = std::cmp::max(2_000_000u64, (datum_bytes + 600) * 4310);
 
     let body = TxBuilderBody {
         inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
@@ -166,9 +169,12 @@ pub fn build_oracle_update_tx(
             },
             redeemer: Some(Redeemer {
                 data: UNIT_REDEEMER_HEX.to_string(),
+                // Generous budget for the real TreasuryMovementValidator mint branch (reads the
+                // control reference datum, checks the signature + NFT qty). The always-ok scaffold
+                // needed ~14k mem; the validator needs much more. Well within Conway tx limits.
                 ex_units: Budget {
-                    mem: 14_000,
-                    steps: 10_000_000,
+                    mem: 2_000_000,
+                    steps: 900_000_000,
                 },
             }),
             script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
