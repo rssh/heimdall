@@ -779,10 +779,73 @@ fn run_sweep_pegins(
     println!("  size:    {} bytes", raw.len());
     println!("  hex:     {}", hex::encode(&raw));
 
+    // `--broadcast` is the master "execute side effects" gate. Without it, sweep-pegins only
+    // builds, signs, and prints the TM (no Cardano post, no Bitcoin broadcast) — a safe dry run.
     if !broadcast {
-        println!("\n(not broadcast — pass --broadcast to send)");
+        println!("\n(not broadcast — pass --broadcast to post the TM / send)");
         return Ok(());
     }
+
+    // Protocol path (technical_documentation.md §"Post signed TM as Unconfirmed TM tx"): when
+    // Blockfrost is configured, hand the signed TM to the shared Cardano chain, which POSTS the
+    // Unconfirmed TM UTxO to Cardano (Constr(0, [signed_btc_tx]) at treasury_address) when
+    // `cardano.submit_oracle` is set, and broadcasts to Bitcoin when `bitcoin.submit` is set. A
+    // watchtower (binocular) then relays to Bitcoin and runs the validated Confirm. NOTE: whether
+    // the BTC tx is broadcast is governed by config (`bitcoin.submit`), NOT by --broadcast — on
+    // this setup heimdall posts to Cardano while binocular `relay` carries it to Bitcoin.
+    if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
+        let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg);
+        let treasury_address = cfg
+            .cardano
+            .treasury_address
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "cardano.treasury_address must be set (the TM validator address)".to_string())?;
+        let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
+        let treasury_asset_name_hex = cfg
+            .cardano
+            .treasury_asset_name
+            .clone()
+            .unwrap_or_else(|| hex::encode("TMTx"));
+        let treasury_config = TreasuryConfig {
+            y_51: fixture.y_51,
+            y_fed: fixture.y_fed,
+            federation_csv_blocks: fixture.federation_csv_blocks,
+            fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
+            per_pegout_fee: fixture.per_pegout_fee,
+        };
+        let mut chain = BlockfrostCardanoChain::new(
+            project_id,
+            &treasury_address,
+            &treasury_policy_id,
+            &treasury_asset_name_hex,
+            treasury_config,
+            fixture.roster.clone(),
+        );
+        if let Some(mnemonic) = &cfg.cardano.mnemonic {
+            chain = chain
+                .with_mnemonic(mnemonic)
+                .map_err(|e| format!("with_mnemonic: {e}"))?;
+        }
+        if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
+            chain = chain.with_btc_rpc(
+                rpc_url,
+                cfg.bitcoin.rpc_user.clone(),
+                cfg.bitcoin.rpc_pass.clone(),
+            );
+        }
+        chain = chain.with_submit_config(
+            cfg.bitcoin.submit,
+            cfg.cardano.submit_oracle,
+            cfg.cardano.oracle_constructor,
+        );
+        rt.block_on(chain.submit_signed_tm(&raw))
+            .map_err(|e| format!("submit_signed_tm: {e}"))?;
+        return Ok(());
+    }
+
+    // Legacy fallback: no Blockfrost configured → direct Bitcoin broadcast only (pre-protocol
+    // shortcut; the TM never lands on Cardano, so binocular confirm-tmtx has nothing to confirm).
     let rpc = btc_rpc_config(cfg)?;
     rt.block_on(broadcast_btc_tx(&rpc, &raw))
         .map_err(|e| format!("broadcast: {e}"))?;

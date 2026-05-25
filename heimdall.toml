@@ -37,7 +37,13 @@ blockfrost_project_id = "preprodsTOaoyjcqGmy4SOSazxuHkbuXFOOkp8f"
 # network_magic = 1
 # pegin_script_address = "addr_test1..."
 # pegin_policy_id = "abcdef..."
-treasury_address = "addr_test1wr40m3xewve8t5lqdnl9le22z0ll8wjm42xk2cmzvpfhjpcum5nzx"
+# TM UTxO address = binocular's TreasuryMovementValidator, parameterized by the oracle script hash
+# (7ba9aae06f9b3e9810bc469b9b6a4e60fcf0d405075f9427f8ddbe17 → TM script hash
+# 224736fb95b955718a0e3647b5d89931f543f89c1d34f43047934157). The Unconfirmed TM UTxO posted here is
+# what `binocular confirm-tmtx` validates + spends. Re-derive with `binocular info` after an oracle
+# or validator change. (Was the old always-ok TmtxScript scaffold addr_test1wr40m3xe…)
+treasury_address = "addr_test1wq3ywdhmjku42uv2pcmy0dwcnycl2slcnswnfapsg7f5z4cd30duu"
+# Marker token (identity NFT riding Unconfirmed→Confirmed); always-ok policy, minted by publish.rs.
 treasury_policy_id = "eafdc4d9733275d3e06cfe5fe54a13fff3ba5baa8d65636260537907"
 treasury_asset_name = "544d5478"
 # mnemonic is loaded from $HEIMDALL_MNEMONIC (see .env, gitignored).
