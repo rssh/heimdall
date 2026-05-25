@@ -25,9 +25,11 @@ rpc_url = "http://127.0.0.1:48332"   # testnet4 RPC (bitcoind -testnet4)
 rpc_user = "bitcoin"
 rpc_pass = "bitcoin"
 submit = false          # broadcast signed BTC tx to rpc_url (false: binocular relay does it)
-# FROST treasury UTXO. STALE: the txid/amount below are the old REGTEST values (treasury addr
-# bcrt1p8009hhk…). On testnet4 the treasury Taproot address re-derives to a tb1p… address (from
-# y_fed_seed_hex) — fund it on testnet4 and set treasury_txid/vout/amount to that funded UTXO.
+# FROST treasury UTXO. The treasury Taproot KEY (from y_fed_seed_hex) is network-independent; only
+# the address encoding changes per network: regtest bcrt1peqh8qtp…q7h2wvk == testnet4
+# tb1peqh8qtppcrw98qewlv59kupv5rs9g9g4gwctzqcwa25pn6md7a0qnwqgev (same witness program).
+# STALE: txid/amount below are old REGTEST-chain values — that UTXO doesn't exist on testnet4. Fund
+# tb1peqh8qtp… on testnet4 and set treasury_txid/vout/amount to that UTXO.
 treasury_txid = "478b7ae50b71603aca16c97d3ee974f98e4ecc55b875fe34fe3cd6afc97f1317"
 treasury_vout = 0
 treasury_amount_sat = 9999887
