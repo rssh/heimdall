@@ -14,21 +14,19 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
+use bitcoin::consensus::deserialize;
 use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
 use pallas_codec::minicbor;
 use pallas_primitives::conway::PlutusData;
 use pallas_wallet::PrivateKey;
 
-use crate::cardano::btc_rpc::{broadcast_btc_tx, BtcRpcConfig};
-use crate::cardano::publish::{build_oracle_update_tx, WalletUtxo};
-use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+use crate::cardano::btc_rpc::{BtcRpcConfig, broadcast_btc_tx};
+use crate::cardano::publish::{WalletUtxo, build_oracle_update_tx};
 use crate::cardano::treasury_datum::TreasuryConfig;
+use crate::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 use crate::epoch::state::{EpochError, EpochResult, Roster};
-use crate::epoch::traits::{
-    CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo,
-};
+use crate::epoch::traits::{CardanoChain, EpochBoundaryEvent, PegOutRequestUtxo, TreasuryUtxo};
 
 pub struct BlockfrostCardanoChain {
     api: BlockfrostAPI,
@@ -114,14 +112,24 @@ impl BlockfrostCardanoChain {
     /// Mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
     /// `binocular tm-script`), referencing the TM-control UTxO `(tx_hash, index)`. Without this the
     /// always-ok scaffold policy is used.
-    pub fn with_tm_policy(mut self, script_cbor: &str, control_tx_hash: &str, control_index: u32) -> Self {
+    pub fn with_tm_policy(
+        mut self,
+        script_cbor: &str,
+        control_tx_hash: &str,
+        control_index: u32,
+    ) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
         self
     }
 
     /// Override submission flags from config.
-    pub fn with_submit_config(mut self, submit_btc: bool, submit_oracle: bool, oracle_constructor: u8) -> Self {
+    pub fn with_submit_config(
+        mut self,
+        submit_btc: bool,
+        submit_oracle: bool,
+        oracle_constructor: u8,
+    ) -> Self {
         self.submit_btc = submit_btc;
         self.submit_oracle = submit_oracle;
         self.oracle_constructor = oracle_constructor;
@@ -160,16 +168,18 @@ impl BlockfrostCardanoChain {
 
     /// Fetch all UTxOs at the wallet base address.
     async fn query_wallet_utxos(&self) -> EpochResult<Vec<WalletUtxo>> {
-        let wallet_addr = self
-            .wallet_base_address
-            .as_deref()
-            .ok_or_else(|| EpochError::Chain("no wallet address — was with_mnemonic called?".into()))?;
+        let wallet_addr = self.wallet_base_address.as_deref().ok_or_else(|| {
+            EpochError::Chain("no wallet address — was with_mnemonic called?".into())
+        })?;
 
         // Raw HTTP + lenient parse (tolerates backends like yaci-devkit that omit `tx_index`).
-        let utxos =
-            crate::cardano::bf_http::fetch_address_utxos(&self.bf_base_url, &self.bf_project_id, wallet_addr)
-                .await
-                .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
+        let utxos = crate::cardano::bf_http::fetch_address_utxos(
+            &self.bf_base_url,
+            &self.bf_project_id,
+            wallet_addr,
+        )
+        .await
+        .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
         Ok(utxos
             .iter()
@@ -180,10 +190,13 @@ impl BlockfrostCardanoChain {
                     .find(|a| a.unit == "lovelace")
                     .map(|a| a.quantity.parse().unwrap_or(0))
                     .unwrap_or(0);
+                // Pure ADA = the only amount entry is lovelace (no native tokens).
+                let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
                 WalletUtxo {
                     tx_hash: u.tx_hash.clone(),
                     output_index: u.output_index,
                     lovelace,
+                    pure_ada,
                 }
             })
             .collect())
@@ -239,23 +252,28 @@ impl CardanoChain for BlockfrostCardanoChain {
         // tag 121 = constructor 0 (unconfirmed), tag 122 = constructor 1 (confirmed).
         let constructor = constr.tag.saturating_sub(121);
         let btc_confirmed = constructor == 1;
-        eprintln!("[blockfrost] treasury datum: constructor={constructor} btc_confirmed={btc_confirmed}");
+        eprintln!(
+            "[blockfrost] treasury datum: constructor={constructor} btc_confirmed={btc_confirmed}"
+        );
 
         let tx_bytes = match constr.fields.first() {
             Some(PlutusData::BoundedBytes(bb)) => {
                 let v: Vec<u8> = bb.clone().into();
                 v
             }
-            _ => return Err(EpochError::Chain(
-                "treasury datum Constr has no BoundedBytes field".into(),
-            )),
+            _ => {
+                return Err(EpochError::Chain(
+                    "treasury datum Constr has no BoundedBytes field".into(),
+                ));
+            }
         };
         let tx: Transaction = deserialize(&tx_bytes)
             .map_err(|e| EpochError::Chain(format!("BTC tx deserialize: {e}")))?;
 
-        let out = tx.output.first().ok_or_else(|| {
-            EpochError::Chain("BTC tx in treasury datum has no outputs".into())
-        })?;
+        let out = tx
+            .output
+            .first()
+            .ok_or_else(|| EpochError::Chain("BTC tx in treasury datum has no outputs".into()))?;
         let txid = tx.compute_txid();
 
         let maybe_key = *self.treasury_y_51.lock().unwrap();
@@ -295,7 +313,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         if self.submit_btc {
             match &self.btc_rpc {
                 Some(rpc) => broadcast_btc_tx(rpc, tx_bytes).await?,
-                None => eprintln!("[submit] bitcoin.submit=true but rpc_url not set — skipping BTC broadcast"),
+                None => eprintln!(
+                    "[submit] bitcoin.submit=true but rpc_url not set — skipping BTC broadcast"
+                ),
             }
         } else {
             eprintln!("[submit] bitcoin.submit=false — skipping BTC broadcast");
@@ -310,7 +330,9 @@ impl CardanoChain for BlockfrostCardanoChain {
         let key = match &self.payment_key {
             Some(k) => k,
             None => {
-                eprintln!("[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)");
+                eprintln!(
+                    "[submit] no mnemonic configured — skipping Cardano oracle publish (dry run)"
+                );
                 return Ok(());
             }
         };
@@ -331,11 +353,25 @@ impl CardanoChain for BlockfrostCardanoChain {
         let total_lovelace: u64 = wallet_utxos.iter().map(|u| u.lovelace).sum();
         eprintln!(
             "[submit] wallet: {} UTxO(s), {} lovelace total",
-            wallet_utxos.len(), total_lovelace,
+            wallet_utxos.len(),
+            total_lovelace,
         );
         eprintln!(
             "[submit] building Cardano oracle-update tx: treasury={} constructor={} policy={}",
             self.treasury_address, self.oracle_constructor, self.treasury_policy_id
+        );
+
+        // Fetch the network's live cost models so the script-integrity hash matches the ledger's
+        // (whisky's hardcoded preprod models are stale — see bf_http::fetch_cost_models).
+        let cost_models =
+            crate::cardano::bf_http::fetch_cost_models(&self.bf_base_url, &self.bf_project_id)
+                .await
+                .map_err(|e| EpochError::Chain(format!("fetch cost models: {e}")))?;
+        eprintln!(
+            "[submit] live cost models: V1={} V2={} V3={} params",
+            cost_models[0].len(),
+            cost_models[1].len(),
+            cost_models[2].len()
         );
 
         let signed_tx_hex = build_oracle_update_tx(
@@ -348,9 +384,8 @@ impl CardanoChain for BlockfrostCardanoChain {
             &wallet_utxos,
             key,
             self.tm_script_cbor.as_deref(),
-            self.tm_control_ref
-                .as_ref()
-                .map(|(h, i)| (h.as_str(), *i)),
+            self.tm_control_ref.as_ref().map(|(h, i)| (h.as_str(), *i)),
+            Some(cost_models),
         )?;
 
         let cardano_tx_cbor = hex::decode(&signed_tx_hex)
@@ -372,4 +407,3 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(())
     }
 }
-

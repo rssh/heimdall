@@ -62,10 +62,7 @@ pub async fn fetch_address_utxos(
                 resp.text().await.unwrap_or_default()
             ));
         }
-        let batch: Vec<BfUtxo> = resp
-            .json()
-            .await
-            .map_err(|e| format!("utxos json: {e}"))?;
+        let batch: Vec<BfUtxo> = resp.json().await.map_err(|e| format!("utxos json: {e}"))?;
         let n = batch.len();
         all.extend(batch);
         if n < 100 {
@@ -74,4 +71,53 @@ pub async fn fetch_address_utxos(
         page += 1;
     }
     Ok(all)
+}
+
+/// Fetch the network's live Plutus cost models (ordered int arrays) from
+/// `/epochs/latest/parameters`, returned as `[PlutusV1, PlutusV2, PlutusV3]`.
+///
+/// whisky-common's hardcoded per-network cost models go stale (e.g. preprod's PlutusV3 grew
+/// from 298 to 350 params), which makes the tx's script-integrity hash mismatch the ledger's
+/// (`PPViewHashesDontMatch`). Passing these live arrays via `Network::Custom` fixes that.
+pub async fn fetch_cost_models(base_url: &str, project_id: &str) -> Result<Vec<Vec<i64>>, String> {
+    let url = format!("{base_url}/epochs/latest/parameters");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("parameters request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "parameters http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parameters json: {e}"))?;
+    // `cost_models_raw` gives each language as an ordered array of ints (the canonical order the
+    // ledger hashes); `cost_models` is the named-map form. Prefer the raw arrays.
+    let raw = v
+        .get("cost_models_raw")
+        .or_else(|| v.get("cost_models"))
+        .ok_or_else(|| "parameters: no cost_models_raw/cost_models".to_string())?;
+    let mut out = Vec::with_capacity(3);
+    for lang in ["PlutusV1", "PlutusV2", "PlutusV3"] {
+        let arr = raw
+            .get(lang)
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| format!("parameters: cost_models[{lang}] not an array"))?;
+        let nums: Vec<i64> = arr
+            .iter()
+            .map(|n| {
+                n.as_i64()
+                    .ok_or_else(|| format!("cost_models[{lang}]: non-int entry"))
+            })
+            .collect::<Result<_, _>>()?;
+        out.push(nums);
+    }
+    Ok(out)
 }

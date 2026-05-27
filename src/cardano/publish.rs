@@ -38,6 +38,9 @@ pub struct WalletUtxo {
     pub tx_hash: String,
     pub output_index: u32,
     pub lovelace: u64,
+    /// True when the UTxO holds only ADA (no native tokens). Collateral inputs must be
+    /// pure-ADA — picking a token-bearing UTxO triggers `CollateralContainsNonADA`.
+    pub pure_ada: bool,
 }
 
 /// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
@@ -87,6 +90,10 @@ pub fn build_oracle_update_tx(
     // falls back to the always-ok scaffold policy (legacy).
     tm_script_cbor: Option<&str>,
     control_ref: Option<(&str, u32)>,
+    // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
+    // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
+    // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
+    cost_models: Option<Vec<Vec<i64>>>,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
@@ -98,13 +105,13 @@ pub fn build_oracle_update_tx(
         .max_by_key(|u| u.lovelace)
         .ok_or_else(|| EpochError::Chain("no wallet UTxOs for fee payment".into()))?;
 
-    // Collateral: required for Plutus minting. Use any UTxO with >= 5 ADA
-    // (can be the same as the fee input).
+    // Collateral: required for Plutus minting. Must be PURE ADA (a token-bearing UTxO triggers
+    // CollateralContainsNonADA) with >= 5 ADA. Can be the same as the fee input.
     let coll_utxo = wallet_utxos
         .iter()
-        .find(|u| u.lovelace >= 5_000_000)
+        .find(|u| u.lovelace >= 5_000_000 && u.pure_ada)
         .ok_or_else(|| {
-            EpochError::Chain("no wallet UTxO with >= 5 ADA for collateral".into())
+            EpochError::Chain("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
         })?;
 
     // Min-UTxO scales with output size — the inline datum carries the whole signed BTC tx, so a
@@ -148,7 +155,10 @@ pub fn build_oracle_update_tx(
         required_signatures: vec![pkh],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(whisky::Network::Preprod),
+        network: Some(match cost_models {
+            Some(cm) => whisky::Network::Custom(cm),
+            None => whisky::Network::Preprod,
+        }),
         // Reference the TM-control UTxO so the validator's mint branch can read the authorized
         // minter from its datum (authenticated by the control NFT it carries).
         reference_inputs: control_ref
@@ -178,7 +188,9 @@ pub fn build_oracle_update_tx(
                 },
             }),
             script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: tm_script_cbor.unwrap_or(ALWAYS_OK_PLUTUS_CBOR_HEX).to_string(),
+                script_cbor: tm_script_cbor
+                    .unwrap_or(ALWAYS_OK_PLUTUS_CBOR_HEX)
+                    .to_string(),
                 language_version: LanguageVersion::V3,
             })),
         })],
@@ -224,8 +236,8 @@ pub fn build_oracle_update_tx(
     vkeys.push(vkey_witness);
     tx.transaction_witness_set.vkeywitness = NonEmptySet::from_vec(vkeys);
 
-    let signed = minicbor::to_vec(&tx)
-        .map_err(|e| EpochError::Chain(format!("signed tx encode: {e}")))?;
+    let signed =
+        minicbor::to_vec(&tx).map_err(|e| EpochError::Chain(format!("signed tx encode: {e}")))?;
     Ok(hex::encode(signed))
 }
 
@@ -238,8 +250,7 @@ mod tests {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
         let hex_str = encode_datum_hex(&btc_tx, 0);
         let cbor = hex::decode(&hex_str).unwrap();
-        let decoded: PlutusData =
-            pallas_codec::minicbor::decode(&cbor).expect("decode");
+        let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
         match decoded {
             PlutusData::Constr(c) => {
                 assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");
