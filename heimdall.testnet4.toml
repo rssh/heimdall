@@ -1,0 +1,31 @@
+# Heimdall config for testnet4 (depositor tool / SPO daemon).
+# Only fields that differ from the compiled-in defaults are set here —
+# every field has a serde default (see src/config.rs).
+
+[bitcoin]
+network = "testnet4"
+
+# RPC endpoint of the binocular-managed bitcoind (../binocular/bitcoind-testnet4.sh).
+rpc_url = "http://127.0.0.1:48332"
+rpc_user = "bitcoin"
+rpc_pass = "bitcoin"
+
+# Depositor refund timelock (BTC blocks). Spec default 4320 (~30 days);
+# demo simplification uses 720 (~5 days). Must match the SPO daemons.
+pegin_refund_timeout_blocks = 720
+
+# 32-byte hex seed for the deterministic demo federation key (Y_fed).
+# Must match what every SPO daemon uses, or your peg-in P2TR address
+# won't be redeemable by the federation. In production this comes from
+# the on-chain treasury oracle.
+y_fed_seed_hex = "fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"
+
+# Broadcast signed BTC tx automatically. Leave false for first-run dry
+# runs (depositor prints raw hex either way); flip to true once you've
+# verified the tx looks right.
+submit = false
+
+# Treasury UTXO fields intentionally omitted — the regtest values in
+# heimdall.toml are wrong for testnet4. Required for the SPO daemon
+# (not for the depositor binary); fill in with real testnet4 values
+# when you wire up the daemon side.

@@ -7,24 +7,25 @@
 //! the `PegInDatum` Constr shape.
 
 use async_trait::async_trait;
-use blockfrost::{BlockFrostSettings, BlockfrostAPI, Pagination};
 
+use crate::cardano::bf_http;
 use crate::cardano::pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};
 use crate::epoch::state::{EpochError, EpochResult};
 
 pub struct BlockfrostPegInSource {
-    api: BlockfrostAPI,
+    base_url: String,
+    project_id: String,
     address: String,
 }
 
 impl BlockfrostPegInSource {
     /// `project_id` is the Blockfrost API key (e.g. `preprodXXXXXX`).
-    /// The network is auto-detected from the key prefix. `address` is
-    /// the bech32 script address carrying peg-in UTxOs.
-    pub fn new(project_id: &str, address: impl Into<String>) -> Self {
-        let api = BlockfrostAPI::new(project_id, BlockFrostSettings::new());
+    /// The network is auto-detected from the key prefix unless `blockfrost_url` overrides it.
+    /// `address` is the bech32 script address carrying peg-in UTxOs.
+    pub fn new(project_id: &str, address: impl Into<String>, blockfrost_url: Option<&str>) -> Self {
         Self {
-            api,
+            base_url: bf_http::base_url(project_id, blockfrost_url),
+            project_id: project_id.to_string(),
             address: address.into(),
         }
     }
@@ -38,27 +39,19 @@ impl CardanoPegInSource for BlockfrostPegInSource {
     ) -> EpochResult<Vec<CardanoPegInRequest>> {
         let policy_hex = hex::encode(policy_id);
 
-        // Blockfrost's asset-filtered endpoint wants `<policy_hex><asset_name_hex>`.
-        // We pass just the policy hex — Blockfrost matches all assets
-        // under that policy at the address. Blockfrost returns 404
-        // when there are no matching UTxOs, which is not an error.
-        let utxos = match self
-            .api
-            .addresses_utxos_asset(&self.address, &policy_hex, Pagination::all())
+        // Fetch all UTxOs at the address (raw HTTP, lenient parse — tolerates backends like
+        // yaci-devkit that omit `tx_index`) and filter by policy locally. (The asset-filtered
+        // endpoint wants the FULL `<policy><name>` unit on some backends, so we don't rely on it.)
+        let utxos = bf_http::fetch_address_utxos(&self.base_url, &self.project_id, &self.address)
             .await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("404") || msg.contains("Not Found") {
-                    return Ok(vec![]);
-                }
-                return Err(EpochError::Chain(format!("blockfrost: {e}")));
-            }
-        };
+            .map_err(EpochError::Chain)?;
 
         let mut out = Vec::new();
         for utxo in utxos {
+            // Keep only UTxOs carrying a token under the peg-in policy.
+            if !utxo.amount.iter().any(|a| a.unit.starts_with(&policy_hex)) {
+                continue;
+            }
             // Inline datum: Blockfrost returns the CBOR as a hex string.
             // We pass the raw bytes through — the parser decodes the
             // Constr shape.

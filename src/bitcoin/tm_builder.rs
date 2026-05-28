@@ -74,6 +74,7 @@ pub enum TmBuildError {
     InsufficientFunds { available: Amount, required: Amount },
     NoPegOutAmountAfterFee { index: usize, amount: Amount, fee: Amount },
     DustOutput { index: usize, value: Amount },
+    MalformedUnsignedTm { inputs: usize, prevouts: usize, spend_infos: usize },
 }
 
 impl fmt::Display for TmBuildError {
@@ -88,6 +89,11 @@ impl fmt::Display for TmBuildError {
             Self::DustOutput { index, value } => {
                 write!(f, "output [{index}] value {value} below dust threshold")
             }
+            Self::MalformedUnsignedTm { inputs, prevouts, spend_infos } => write!(
+                f,
+                "malformed UnsignedTm: {inputs} inputs but {prevouts} prevouts \
+                 and {spend_infos} spend infos (all must match)"
+            ),
         }
     }
 }
@@ -260,9 +266,11 @@ pub fn build_tm(
     let mut outputs = Vec::with_capacity(num_outputs);
 
     let change_value = total_input.checked_sub(required).expect("checked above");
-    // Change can be zero only if there's nothing left — but that would mean
-    // the treasury is empty. Allow dust-or-above change, error on sub-dust non-zero.
-    if change_value > Amount::ZERO && change_value < DUST_THRESHOLD {
+    // output[0] is always the new treasury, so it must carry a spendable
+    // balance. Reject any sub-dust value, including zero (which would mean the
+    // inputs exactly covered fee+peg-outs and left nothing for the treasury) —
+    // a zero/dust output[0] is non-standard and would be rejected on broadcast.
+    if change_value < DUST_THRESHOLD {
         return Err(TmBuildError::DustOutput {
             index: 0,
             value: change_value,
@@ -312,6 +320,62 @@ pub fn compute_sighashes(unsigned_tm: &UnsignedTm) -> Vec<[u8; 32]> {
             sighash.to_byte_array()
         })
         .collect()
+}
+
+/// Sign every input of a key-path-spend TM with a **single** secret key,
+/// applying each input's BIP-341 taptweak (`input_spend_info[i].merkle_root()`).
+///
+/// In the demo the treasury and all peg-in deposits are key-pathed on the same
+/// federation key (`Y_fed` = `Y_51`), so one `secret` signs every input; each
+/// input is still tweaked with its own script-tree merkle root. Returns the
+/// witnessed transaction. A `secret` that does not match an input's internal key
+/// produces a signature that won't validate under that input's output key — the
+/// caller should verify before broadcasting.
+///
+/// Returns [`TmBuildError::MalformedUnsignedTm`] if the input/prevout/spend-info
+/// counts disagree (e.g. a hand-constructed `UnsignedTm`); a TM built by
+/// [`build_tm`] always satisfies the invariant.
+pub fn sign_tm_single_key(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    unsigned: &UnsignedTm,
+    secret: &bitcoin::secp256k1::SecretKey,
+) -> Result<Transaction, TmBuildError> {
+    use bitcoin::key::TapTweak;
+    use bitcoin::secp256k1::{Keypair, Message};
+
+    let n = unsigned.tx.input.len();
+    if unsigned.prevouts.len() != n || unsigned.input_spend_info.len() != n {
+        return Err(TmBuildError::MalformedUnsignedTm {
+            inputs: n,
+            prevouts: unsigned.prevouts.len(),
+            spend_infos: unsigned.input_spend_info.len(),
+        });
+    }
+
+    let sighashes = compute_sighashes(unsigned);
+    let keypair = Keypair::from_secret_key(secp, secret);
+    let mut tx = unsigned.tx.clone();
+    // Zip the three same-length slices so witness assembly carries no `[i]` indexing — the
+    // MalformedUnsignedTm guard above already proves the lengths agree, but iterator-zip makes
+    // the absence of any panic site syntactically obvious (and stays correct if a future caller
+    // bypasses the guard).
+    for ((txin, spend_info), sighash) in tx
+        .input
+        .iter_mut()
+        .zip(unsigned.input_spend_info.iter())
+        .zip(sighashes.iter())
+    {
+        let merkle_root = spend_info.merkle_root();
+        let tweaked = keypair.tap_tweak(secp, merkle_root);
+        let msg = Message::from_digest(*sighash);
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
+        let tap_sig = bitcoin::taproot::Signature {
+            signature: sig,
+            sighash_type: TapSighashType::Default,
+        };
+        txin.witness = Witness::p2tr_key_spend(&tap_sig);
+    }
+    Ok(tx)
 }
 
 #[cfg(test)]
@@ -378,6 +442,47 @@ mod tests {
         let secp = Secp256k1::new();
         let key = xonly_from_seed([0xFFu8; 32]);
         ScriptBuf::new_p2tr(&secp, key, None)
+    }
+
+    /// Secret key matching `xonly_from_seed(seed)` (both hash the seed first).
+    fn sk_from_seed(seed: [u8; 32]) -> bitcoin::secp256k1::SecretKey {
+        use bitcoin::hashes::{sha256, Hash as _};
+        bitcoin::secp256k1::SecretKey::from_slice(sha256::Hash::hash(&seed).as_ref()).unwrap()
+    }
+
+    // --- Single-key signer ---
+
+    #[test]
+    fn test_single_key_signer_verifies_under_output_key() {
+        let secp = Secp256k1::new();
+        // The test treasury/peg-in spend infos use internal key y_51 = xonly_from_seed([1;32]).
+        let sk = sk_from_seed([1u8; 32]);
+        assert_eq!(sk.x_only_public_key(&secp).0, xonly_from_seed([1u8; 32]));
+
+        let fee_params = default_fee_params();
+        let tm = build_tm(
+            make_treasury_input(0xAA, 1_000_000),
+            vec![make_pegin_input(0xBB, 0, 500_000)],
+            vec![],
+            change_address(),
+            &fee_params,
+        )
+        .unwrap();
+
+        let signed = sign_tm_single_key(&secp, &tm, &sk).unwrap();
+        let sighashes = compute_sighashes(&tm);
+
+        assert_eq!(signed.input.len(), 2);
+        for (i, txin) in signed.input.iter().enumerate() {
+            let items = txin.witness.to_vec();
+            assert_eq!(items.len(), 1, "input {i}: key-path witness is one element");
+            assert_eq!(items[0].len(), 64, "input {i}: Default-sighash sig is 64 bytes");
+            let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&items[0]).unwrap();
+            let msg = bitcoin::secp256k1::Message::from_digest(sighashes[i]);
+            let outkey = tm.input_spend_info[i].output_key().to_x_only_public_key();
+            secp.verify_schnorr(&sig, &msg, &outkey)
+                .unwrap_or_else(|e| panic!("input {i} sig invalid under output key: {e}"));
+        }
     }
 
     // --- Determinism ---

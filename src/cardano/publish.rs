@@ -38,6 +38,9 @@ pub struct WalletUtxo {
     pub tx_hash: String,
     pub output_index: u32,
     pub lovelace: u64,
+    /// True when the UTxO holds only ADA (no native tokens). Collateral inputs must be
+    /// pure-ADA — picking a token-bearing UTxO triggers `CollateralContainsNonADA`.
+    pub pure_ada: bool,
 }
 
 /// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
@@ -80,6 +83,17 @@ pub fn build_oracle_update_tx(
     constructor: u8,
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
+    // When `Some`, mint the TM NFT under the real TreasuryMovementValidator policy (CBOR from
+    // `binocular tm-script`) and reference the TM-control UTxO `(tx_hash, index)` so the validator
+    // can read the authorized minter. `treasury_policy_id` must then be the validator's script hash
+    // and `treasury_asset_name_hex` empty (the validator counts the empty-name token). When `None`,
+    // falls back to the always-ok scaffold policy (legacy).
+    tm_script_cbor: Option<&str>,
+    control_ref: Option<(&str, u32)>,
+    // When `Some`, the network's live Plutus cost models `[V1, V2, V3]` (from Blockfrost). Used via
+    // `Network::Custom` so the script-integrity hash matches the ledger's even when whisky's
+    // hardcoded per-network cost models are stale. `None` → whisky's built-in Preprod models.
+    cost_models: Option<Vec<Vec<i64>>>,
 ) -> EpochResult<String> {
     let pkh = pub_key_hash_hex(key);
     let datum_hex = encode_datum_hex(signed_btc_tx, constructor);
@@ -91,17 +105,20 @@ pub fn build_oracle_update_tx(
         .max_by_key(|u| u.lovelace)
         .ok_or_else(|| EpochError::Chain("no wallet UTxOs for fee payment".into()))?;
 
-    // Collateral: required for Plutus minting. Use any UTxO with >= 5 ADA
-    // (can be the same as the fee input).
+    // Collateral: required for Plutus minting. Must be PURE ADA (a token-bearing UTxO triggers
+    // CollateralContainsNonADA) with >= 5 ADA. Can be the same as the fee input.
     let coll_utxo = wallet_utxos
         .iter()
-        .find(|u| u.lovelace >= 5_000_000)
+        .find(|u| u.lovelace >= 5_000_000 && u.pure_ada)
         .ok_or_else(|| {
-            EpochError::Chain("no wallet UTxO with >= 5 ADA for collateral".into())
+            EpochError::Chain("no pure-ADA wallet UTxO with >= 5 ADA for collateral".into())
         })?;
 
-    // Min-UTxO for the oracle output with inline datum + token (~2 ADA).
-    let oracle_lovelace = 2_000_000u64;
+    // Min-UTxO scales with output size — the inline datum carries the whole signed BTC tx, so a
+    // flat 2 ADA is too small (BabbageOutputTooSmallUTxO). Approximate Conway min-UTxO
+    // (coinsPerUTxOByte = 4310) generously from the datum size, with a 2-ADA floor.
+    let datum_bytes = (datum_hex.len() / 2) as u64;
+    let oracle_lovelace = std::cmp::max(2_000_000u64, (datum_bytes + 600) * 4310);
 
     let body = TxBuilderBody {
         inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
@@ -138,8 +155,21 @@ pub fn build_oracle_update_tx(
         required_signatures: vec![pkh],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
-        network: Some(whisky::Network::Preprod),
-        reference_inputs: vec![],
+        network: Some(match cost_models {
+            Some(cm) => whisky::Network::Custom(cm),
+            None => whisky::Network::Preprod,
+        }),
+        // Reference the TM-control UTxO so the validator's mint branch can read the authorized
+        // minter from its datum (authenticated by the control NFT it carries).
+        reference_inputs: control_ref
+            .map(|(h, i)| {
+                vec![RefTxIn {
+                    tx_hash: h.to_string(),
+                    tx_index: i,
+                    script_size: None,
+                }]
+            })
+            .unwrap_or_default(),
         withdrawals: vec![],
         mints: vec![MintItem::ScriptMint(ScriptMint {
             mint: MintParameter {
@@ -149,13 +179,18 @@ pub fn build_oracle_update_tx(
             },
             redeemer: Some(Redeemer {
                 data: UNIT_REDEEMER_HEX.to_string(),
+                // Generous budget for the real TreasuryMovementValidator mint branch (reads the
+                // control reference datum, checks the signature + NFT qty). The always-ok scaffold
+                // needed ~14k mem; the validator needs much more. Well within Conway tx limits.
                 ex_units: Budget {
-                    mem: 14_000,
-                    steps: 10_000_000,
+                    mem: 2_000_000,
+                    steps: 900_000_000,
                 },
             }),
             script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: ALWAYS_OK_PLUTUS_CBOR_HEX.to_string(),
+                script_cbor: tm_script_cbor
+                    .unwrap_or(ALWAYS_OK_PLUTUS_CBOR_HEX)
+                    .to_string(),
                 language_version: LanguageVersion::V3,
             })),
         })],
@@ -201,8 +236,8 @@ pub fn build_oracle_update_tx(
     vkeys.push(vkey_witness);
     tx.transaction_witness_set.vkeywitness = NonEmptySet::from_vec(vkeys);
 
-    let signed = minicbor::to_vec(&tx)
-        .map_err(|e| EpochError::Chain(format!("signed tx encode: {e}")))?;
+    let signed =
+        minicbor::to_vec(&tx).map_err(|e| EpochError::Chain(format!("signed tx encode: {e}")))?;
     Ok(hex::encode(signed))
 }
 
@@ -215,8 +250,7 @@ mod tests {
         let btc_tx = vec![0x02, 0x00, 0x00, 0x00];
         let hex_str = encode_datum_hex(&btc_tx, 0);
         let cbor = hex::decode(&hex_str).unwrap();
-        let decoded: PlutusData =
-            pallas_codec::minicbor::decode(&cbor).expect("decode");
+        let decoded: PlutusData = pallas_codec::minicbor::decode(&cbor).expect("decode");
         match decoded {
             PlutusData::Constr(c) => {
                 assert_eq!(c.tag, 121, "should be constructor 0 (unconfirmed)");

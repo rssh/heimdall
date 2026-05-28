@@ -137,6 +137,64 @@ enum Commands {
         #[arg(default_value = "400")]
         max_signers: u16,
     },
+    /// Self-send the bootstrap treasury UTXO so the treasury becomes output[0]
+    /// (normalises a faucet funding tx; see internal-docs decisions D1).
+    /// Key-path spend signed with the single y_fed key. Prints the signed tx;
+    /// broadcasts only with --broadcast.
+    TreasurySelfSend {
+        #[arg(long)]
+        config: Option<String>,
+        /// Funding outpoint to spend, as <txid>:<vout>.
+        #[arg(long)]
+        outpoint: String,
+        /// Input amount in satoshis.
+        #[arg(long)]
+        amount_sat: u64,
+        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        #[arg(long)]
+        broadcast: bool,
+    },
+    /// Print the Cardano wallet base address + payment key hash (the TM-NFT mint
+    /// authority) derived from the configured mnemonic / $HEIMDALL_MNEMONIC.
+    WalletAddress {
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
+    /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
+    /// discovered deposits into a new treasury output[0]. Key-path spend signed
+    /// with the single y_fed key. See internal-docs sweep-pegins-handoff.md.
+    SweepPegins {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to a running Cardano node's Unix socket (e.g. /tmp/yaci-node.socket).
+        #[arg(long)]
+        cardano_socket: String,
+        /// Cardano network magic (`42` for the yaci devnet).
+        #[arg(long)]
+        cardano_magic: u64,
+        /// Bech32 address of the peg-in script holding the PegInRequest UTxOs.
+        #[arg(long)]
+        pegin_script_address: String,
+        /// Peg-in policy ID as 56 hex chars (28 bytes).
+        #[arg(long)]
+        pegin_policy_id: String,
+        /// Current treasury outpoint to sweep, as <txid>:<vout>.
+        #[arg(long)]
+        treasury_outpoint: String,
+        /// Treasury input amount in satoshis.
+        #[arg(long)]
+        treasury_amount_sat: u64,
+        /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
+        #[arg(long)]
+        broadcast: bool,
+        /// Override the locally-built signed TM with these raw BTC tx bytes (hex). Use when
+        /// the on-chain TM bytes are fixed (already confirmed on Bitcoin) but the local builder
+        /// would produce different bytes (e.g. different PIR set). Cardano TM datum will contain
+        /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
+        #[arg(long)]
+        existing_tm_hex: Option<String>,
+    },
 }
 
 fn load_config(path: Option<&str>) -> HeimdallConfig {
@@ -244,6 +302,99 @@ fn main() {
         } => {
             run_proof_demo(min_signers, max_signers);
         }
+        Commands::TreasurySelfSend {
+            config,
+            outpoint,
+            amount_sat,
+            broadcast,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_treasury_self_send(&cfg, &outpoint, amount_sat, broadcast) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::WalletAddress { config } => {
+            let cfg = load_config(config.as_deref());
+            let mnemonic = cfg
+                .cardano
+                .mnemonic
+                .clone()
+                .or_else(|| {
+                    std::env::var("HEIMDALL_MNEMONIC")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("Error: no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)");
+                    std::process::exit(1);
+                });
+            match (
+                heimdall::cardano::wallet::wallet_address_from_mnemonic(&mnemonic),
+                heimdall::cardano::wallet::derive_payment_key(&mnemonic),
+            ) {
+                (Ok(addr), Ok(key)) => {
+                    println!("wallet base address: {addr}");
+                    println!(
+                        "payment key hash:    {}",
+                        heimdall::cardano::wallet::pub_key_hash_hex(&key)
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::SweepPegins {
+            config,
+            cardano_socket,
+            cardano_magic,
+            pegin_script_address,
+            pegin_policy_id,
+            treasury_outpoint,
+            treasury_amount_sat,
+            broadcast,
+            existing_tm_hex,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_sweep_pegins(
+                &cfg,
+                &cardano_socket,
+                cardano_magic,
+                &pegin_script_address,
+                &pegin_policy_id,
+                &treasury_outpoint,
+                treasury_amount_sat,
+                broadcast,
+                existing_tm_hex.as_deref(),
+            ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Apply the real TM-NFT minting policy to the chain when both `cardano.tm_script_cbor` and
+/// `cardano.tm_control_ref` are configured (else leave it on the always-ok scaffold). Errors on a
+/// half-configured pair or a malformed control ref (`<tx_hash>#<index>`).
+fn apply_tm_policy(
+    chain: BlockfrostCardanoChain,
+    cfg: &HeimdallConfig,
+) -> Result<BlockfrostCardanoChain, String> {
+    match (&cfg.cardano.tm_script_cbor, &cfg.cardano.tm_control_ref) {
+        (Some(cbor), Some(r)) => {
+            let (h, i) = r
+                .split_once('#')
+                .and_then(|(h, i)| i.parse::<u32>().ok().map(|i| (h, i)))
+                .ok_or_else(|| {
+                    format!("cardano.tm_control_ref must be <tx_hash>#<index>, got '{r}'")
+                })?;
+            Ok(chain.with_tm_policy(cbor, h, i))
+        }
+        (None, None) => Ok(chain),
+        _ => Err("set both cardano.tm_script_cbor and cardano.tm_control_ref (or neither)".into()),
     }
 }
 
@@ -297,6 +448,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             &treasury_asset_name_hex,
             treasury_config,
             fixture.roster.clone(),
+            cfg.cardano.blockfrost_url.as_deref(),
         );
 
         if let Some(mnemonic) = &cfg.cardano.mnemonic {
@@ -321,9 +473,14 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+        let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
 
         chain = Arc::new(bf_chain);
-        pegin_source = Arc::new(BlockfrostPegInSource::new(project_id, &script_address));
+        pegin_source = Arc::new(BlockfrostPegInSource::new(
+            project_id,
+            &script_address,
+            cfg.cardano.blockfrost_url.as_deref(),
+        ));
     } else if let Some(socket) = cfg.cardano.socket_path.clone() {
         let magic = cfg
             .cardano
@@ -445,6 +602,386 @@ fn port_from_url(url: &str) -> u16 {
         .unwrap_or_else(|| panic!("cannot parse port from bifrost_url {url:?}"))
 }
 
+/// Derive the bootstrap federation keypair from `bitcoin.y_fed_seed_hex`.
+/// At bootstrap Y_51 = Y_fed, so the seed's secret key signs every TM input
+/// and its x-only pubkey is both the treasury and peg-in internal key.
+fn y_fed_keypair(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+    cfg: &HeimdallConfig,
+) -> Result<(bitcoin::secp256k1::SecretKey, bitcoin::key::UntweakedPublicKey), String> {
+    let seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
+        .map_err(|e| format!("y_fed_seed_hex: {e}"))?
+        .try_into()
+        .map_err(|_| "y_fed_seed_hex must be 32 bytes".to_string())?;
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&seed)
+        .map_err(|e| format!("seed -> sk: {e}"))?;
+    let y_fed = sk.x_only_public_key(secp).0;
+    Ok((sk, y_fed))
+}
+
+/// Parse a `<txid>:<vout>` outpoint.
+fn parse_outpoint(s: &str) -> Result<bitcoin::OutPoint, String> {
+    use std::str::FromStr;
+    bitcoin::OutPoint::from_str(s)
+        .map_err(|e| format!("outpoint must be <txid>:<vout>, got '{s}': {e}"))
+}
+
+/// Narrow the configured federation CSV timelock to `u16` (the width required
+/// by the relative-timelock encoding). Errors if the value exceeds `u16::MAX`,
+/// since a silent truncation would change the Taproot spend path and produce an
+/// invalid scriptPubKey / signatures.
+fn csv_blocks_u16(cfg: &HeimdallConfig) -> Result<u16, String> {
+    u16::try_from(cfg.bitcoin.federation_csv_blocks).map_err(|_| {
+        format!(
+            "federation_csv_blocks ({}) exceeds u16::MAX ({})",
+            cfg.bitcoin.federation_csv_blocks,
+            u16::MAX
+        )
+    })
+}
+
+/// Build `FeeParams` from the Bitcoin config section.
+fn fee_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::FeeParams {
+    heimdall::bitcoin::tm_builder::FeeParams {
+        fee_rate_sat_per_vb: cfg.bitcoin.fee_rate_sat_per_vb,
+        per_pegout_fee: bitcoin::Amount::from_sat(cfg.bitcoin.per_pegout_fee_sat),
+    }
+}
+
+/// Build the Bitcoin RPC config; errors if `bitcoin.rpc_url` is unset.
+fn btc_rpc_config(cfg: &HeimdallConfig) -> Result<heimdall::cardano::btc_rpc::BtcRpcConfig, String> {
+    let url = cfg
+        .bitcoin
+        .rpc_url
+        .clone()
+        .ok_or_else(|| "bitcoin.rpc_url not set in config".to_string())?;
+    Ok(heimdall::cardano::btc_rpc::BtcRpcConfig {
+        url,
+        user: cfg.bitcoin.rpc_user.clone(),
+        pass: cfg.bitcoin.rpc_pass.clone(),
+    })
+}
+
+/// Build (and optionally broadcast) a self-send of the bootstrap treasury UTXO
+/// to a tx whose output[0] is the treasury — so `query_treasury` (which reads
+/// vout 0) sees it. Key-path spend with the single `y_fed` key.
+fn run_treasury_self_send(
+    cfg: &HeimdallConfig,
+    outpoint: &str,
+    amount_sat: u64,
+    broadcast: bool,
+) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::{Amount, ScriptBuf};
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, TreasuryInput};
+    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+
+    let secp = Secp256k1::new();
+    let outpoint = parse_outpoint(outpoint)?;
+    let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let csv = csv_blocks_u16(cfg)?;
+
+    let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
+    let treasury_spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+
+    // Only the treasury input, no peg-ins/peg-outs => single output[0] = treasury.
+    let unsigned = build_tm(
+        TreasuryInput {
+            outpoint,
+            value: Amount::from_sat(amount_sat),
+            spend_info,
+        },
+        vec![],
+        vec![],
+        treasury_spk,
+        &fee_params_from_cfg(cfg),
+    )
+    .map_err(|e| format!("build self-send: {e}"))?;
+
+    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
+        .map_err(|e| format!("sign self-send: {e}"))?;
+    let raw = bitcoin::consensus::encode::serialize(&signed);
+
+    println!("self-send txid : {}", signed.compute_txid());
+    println!("output[0]      : {} sat (treasury)", signed.output[0].value.to_sat());
+    println!("raw tx         : {}", hex::encode(&raw));
+
+    if !broadcast {
+        println!("(not broadcast — pass --broadcast to send)");
+        return Ok(());
+    }
+    let rpc = btc_rpc_config(cfg)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(broadcast_btc_tx(&rpc, &raw))
+        .map_err(|e| format!("broadcast: {e}"))?;
+    println!("broadcast OK");
+    Ok(())
+}
+
+/// Scan binocular's on-chain `PegInRequest` UTxOs over N2C, then build, sign and
+/// (optionally) broadcast the Treasury Movement sweeping the current treasury +
+/// all discovered deposits into a new treasury `output[0]`.
+///
+/// The deposits are *discovered* from Cardano (not hand-typed): each PIR is
+/// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
+/// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
+/// so a successful parse is itself proof the spend-info matches the on-chain
+/// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
+/// not required for the pure-Bitcoin sweep).
+#[allow(clippy::too_many_arguments)]
+fn run_sweep_pegins(
+    cfg: &HeimdallConfig,
+    cardano_socket: &str,
+    cardano_magic: u64,
+    pegin_script_address: &str,
+    pegin_policy_id: &str,
+    treasury_outpoint: &str,
+    treasury_amount_sat: u64,
+    broadcast: bool,
+    existing_tm_hex: Option<&str>,
+) -> Result<(), String> {
+    use bitcoin::key::Secp256k1;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
+    use heimdall::bitcoin::taproot::treasury_spend_info;
+    use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, PegInInput, TreasuryInput};
+    use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
+    use heimdall::cardano::btc_rpc::broadcast_btc_tx;
+    use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
+    use heimdall::cardano::pegin_datum::parse_pegin_request;
+    use heimdall::cardano::pegin_source::CardanoPegInSource;
+
+    let secp = Secp256k1::new();
+    let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
+    let csv = csv_blocks_u16(cfg)?;
+    let refund_timeout = cfg.bitcoin.pegin_refund_timeout_blocks;
+
+    let policy_id: [u8; 28] = hex::decode(pegin_policy_id)
+        .map_err(|e| format!("pegin_policy_id: {e}"))?
+        .try_into()
+        .map_err(|_| "pegin_policy_id must be 28 bytes (56 hex chars)".to_string())?;
+
+    // One runtime for both the peg-in scan and the (optional) broadcast.
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // Scan PegInRequests: via Blockfrost (incl. yaci-devkit's blockfrost_url) when configured,
+    // else via the N2C socket.
+    let source: Box<dyn CardanoPegInSource> =
+        if let Some(pid) = cfg.cardano.blockfrost_project_id.as_deref() {
+            Box::new(BlockfrostPegInSource::new(
+                pid,
+                pegin_script_address,
+                cfg.cardano.blockfrost_url.as_deref(),
+            ))
+        } else {
+            Box::new(
+                PallasPegInSource::from_bech32(
+                    cardano_socket,
+                    NetworkMagic(cardano_magic),
+                    pegin_script_address,
+                )
+                .map_err(|e| format!("pallas source: {e}"))?,
+            )
+        };
+    let reqs = rt
+        .block_on(source.query_pegin_requests(&policy_id))
+        .map_err(|e| format!("query_pegin_requests: {e}"))?;
+    println!("scanned {} peg-in request(s) at {pegin_script_address}", reqs.len());
+
+    // Each parse reconstructs and matches the peg-in P2TR, so the returned
+    // `spend_info` is itself proof the spend info matches the on-chain
+    // scriptPubKey — reuse it directly rather than re-deriving.
+    let mut pegin_inputs = Vec::with_capacity(reqs.len());
+    for req in &reqs {
+        let parsed = parse_pegin_request(req, y_fed, refund_timeout)
+            .map_err(|e| format!("parse_pegin_request: {e}"))?;
+        println!(
+            "  peg-in {}:{} — {} sat (depositor {})",
+            parsed.btc_txid,
+            parsed.btc_vout,
+            parsed.value.to_sat(),
+            hex::encode(parsed.depositor_xonly_pubkey.serialize()),
+        );
+        pegin_inputs.push(PegInInput {
+            outpoint: OutPoint {
+                txid: parsed.btc_txid,
+                vout: parsed.btc_vout,
+            },
+            value: parsed.value,
+            spend_info: parsed.spend_info,
+        });
+    }
+
+    let treasury_outpoint = parse_outpoint(treasury_outpoint)?;
+    let treasury_spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv);
+    let treasury_spk = ScriptBuf::new_p2tr_tweaked(treasury_spend_info.output_key());
+
+    // Treasury self-funds the fee; output[0] = new treasury = sum(inputs) − fee.
+    let unsigned = build_tm(
+        TreasuryInput {
+            outpoint: treasury_outpoint,
+            value: Amount::from_sat(treasury_amount_sat),
+            spend_info: treasury_spend_info,
+        },
+        pegin_inputs,
+        vec![],
+        treasury_spk.clone(),
+        &fee_params_from_cfg(cfg),
+    )
+    .map_err(|e| format!("build sweep: {e}"))?;
+
+    // output[0] is the new treasury; if it doesn't carry the treasury
+    // scriptPubKey the whole balance would move to the wrong address, so
+    // refuse before signing rather than broadcast a misdirected sweep.
+    if unsigned.tx.output[0].script_pubkey != treasury_spk {
+        return Err(format!(
+            "output[0] scriptPubKey {} does not match treasury spk {}",
+            hex::encode(unsigned.tx.output[0].script_pubkey.as_bytes()),
+            hex::encode(treasury_spk.as_bytes()),
+        ));
+    }
+
+    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
+        .map_err(|e| format!("sign sweep: {e}"))?;
+    let local_raw = bitcoin::consensus::encode::serialize(&signed);
+    // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
+    // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)
+    // reflects the bytes Cardano will actually see — operators would otherwise copy-paste the
+    // wrong txid from the locally-signed value.
+    let (effective_tx, raw, override_in_effect): (Transaction, Vec<u8>, bool) =
+        if let Some(hex_str) = existing_tm_hex {
+            let trimmed = hex_str.trim();
+            let bytes = hex::decode(trimmed)
+                .map_err(|e| format!("existing_tm_hex: {e}"))?;
+            let tx: Transaction = bitcoin::consensus::deserialize(&bytes).map_err(|e| {
+                format!("existing_tm_hex: not a valid Bitcoin transaction: {e}")
+            })?;
+            // Slice into `trimmed` (not the un-trimmed `hex_str`) — otherwise leading/trailing
+            // whitespace makes `hex_str.len()` bigger than `trimmed.len()` and the slice panics.
+            let preview_end = trimmed.len().min(20);
+            println!(
+                "  [override] using existing TM bytes ({} bytes hex={}…)",
+                bytes.len(),
+                &trimmed[..preview_end]
+            );
+            (tx, bytes, true)
+        } else {
+            (signed, local_raw, false)
+        };
+
+    println!("\n── Treasury Movement (sweep peg-ins) ──");
+    println!("  txid:    {}", effective_tx.compute_txid());
+    println!("  inputs:  {}", effective_tx.input.len());
+    for (i, (inp, prevout)) in effective_tx.input.iter().zip(unsigned.prevouts.iter()).enumerate() {
+        println!(
+            "    [{}] {}:{} — {} sat  script={}",
+            i,
+            inp.previous_output.txid,
+            inp.previous_output.vout,
+            prevout.value.to_sat(),
+            hex::encode(prevout.script_pubkey.as_bytes()),
+        );
+    }
+    println!("  outputs: {}", effective_tx.output.len());
+    for (i, out) in effective_tx.output.iter().enumerate() {
+        println!(
+            "    [{}] {} sat  script={}",
+            i,
+            out.value.to_sat(),
+            hex::encode(out.script_pubkey.as_bytes()),
+        );
+    }
+    println!(
+        "  output[0] (new treasury): {} sat",
+        effective_tx.output[0].value.to_sat()
+    );
+    println!("  size:    {} bytes", raw.len());
+    println!("  hex:     {}", hex::encode(&raw));
+
+    // `--broadcast` is the master "execute side effects" gate. Without it, sweep-pegins only
+    // builds, signs, and prints the TM (no Cardano post, no Bitcoin broadcast) — a safe dry run.
+    if !broadcast {
+        println!("\n(not broadcast — pass --broadcast to post the TM / send)");
+        return Ok(());
+    }
+
+    // Protocol path (technical_documentation.md §"Post signed TM as Unconfirmed TM tx"): when
+    // Blockfrost is configured, hand the signed TM to the shared Cardano chain, which POSTS the
+    // Unconfirmed TM UTxO to Cardano (Constr(0, [signed_btc_tx]) at treasury_address) when
+    // `cardano.submit_oracle` is set, and broadcasts to Bitcoin when `bitcoin.submit` is set. A
+    // watchtower (binocular) then relays to Bitcoin and runs the validated Confirm. NOTE: whether
+    // the BTC tx is broadcast is governed by config (`bitcoin.submit`), NOT by --broadcast — on
+    // this setup heimdall posts to Cardano while binocular `relay` carries it to Bitcoin.
+    if let Some(project_id) = cfg.cardano.blockfrost_project_id.as_deref() {
+        let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(cfg);
+        let treasury_address = cfg
+            .cardano
+            .treasury_address
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "cardano.treasury_address must be set (the TM validator address)".to_string())?;
+        let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
+        let treasury_asset_name_hex = cfg
+            .cardano
+            .treasury_asset_name
+            .clone()
+            .unwrap_or_else(|| hex::encode("TMTx"));
+        let treasury_config = TreasuryConfig {
+            y_51: fixture.y_51,
+            y_fed: fixture.y_fed,
+            federation_csv_blocks: fixture.federation_csv_blocks,
+            fee_rate_sat_per_vb: fixture.fee_rate_sat_per_vb,
+            per_pegout_fee: fixture.per_pegout_fee,
+        };
+        let mut chain = BlockfrostCardanoChain::new(
+            project_id,
+            &treasury_address,
+            &treasury_policy_id,
+            &treasury_asset_name_hex,
+            treasury_config,
+            fixture.roster.clone(),
+            cfg.cardano.blockfrost_url.as_deref(),
+        );
+        if let Some(mnemonic) = &cfg.cardano.mnemonic {
+            chain = chain
+                .with_mnemonic(mnemonic)
+                .map_err(|e| format!("with_mnemonic: {e}"))?;
+        }
+        if let Some(rpc_url) = &cfg.bitcoin.rpc_url {
+            chain = chain.with_btc_rpc(
+                rpc_url,
+                cfg.bitcoin.rpc_user.clone(),
+                cfg.bitcoin.rpc_pass.clone(),
+            );
+        }
+        // Honor the documented contract: when the BTC TM bytes come from `--existing-tm-hex`,
+        // the tx is already on Bitcoin (and would be a double-spend), so DON'T let the chain
+        // re-broadcast it regardless of how `bitcoin.submit` is set in the config.
+        let bitcoin_submit = if override_in_effect {
+            false
+        } else {
+            cfg.bitcoin.submit
+        };
+        chain = chain.with_submit_config(
+            bitcoin_submit,
+            cfg.cardano.submit_oracle,
+            cfg.cardano.oracle_constructor,
+        );
+        let chain = apply_tm_policy(chain, cfg)?;
+        rt.block_on(chain.submit_signed_tm(&raw))
+            .map_err(|e| format!("submit_signed_tm: {e}"))?;
+        return Ok(());
+    }
+
+    // Legacy fallback: no Blockfrost configured → direct Bitcoin broadcast only (pre-protocol
+    // shortcut; the TM never lands on Cardano, so binocular confirm-tmtx has nothing to confirm).
+    let rpc = btc_rpc_config(cfg)?;
+    rt.block_on(broadcast_btc_tx(&rpc, &raw))
+        .map_err(|e| format!("broadcast: {e}"))?;
+    println!("broadcast OK");
+    Ok(())
+}
+
 fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     use bitcoin::key::{Secp256k1, UntweakedPublicKey};
     use bitcoin::secp256k1::SecretKey;
@@ -468,7 +1005,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     .unwrap();
 
     let network = cfg.bitcoin.parsed_network();
-    let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv_blocks = csv_blocks_u16(cfg).unwrap_or_else(|e| panic!("{e}"));
 
     // At bootstrap Y_51 = Y_fed.
     let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv_blocks);
@@ -490,7 +1027,7 @@ fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) {
 
     let secp = Secp256k1::new();
     let network = cfg.bitcoin.parsed_network();
-    let csv_blocks = cfg.bitcoin.federation_csv_blocks as u16;
+    let csv_blocks = csv_blocks_u16(cfg).unwrap_or_else(|e| panic!("{e}"));
 
     let hex_str = frost_key_hex.expect("--frost-key <32-byte-hex> is required");
     let bytes: Vec<u8> = hex::decode(hex_str).expect("--frost-key must be valid hex");
