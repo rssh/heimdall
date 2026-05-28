@@ -188,6 +188,12 @@ enum Commands {
         /// Actually broadcast via bitcoin.rpc_url (default: build + print only).
         #[arg(long)]
         broadcast: bool,
+        /// Override the locally-built signed TM with these raw BTC tx bytes (hex). Use when
+        /// the on-chain TM bytes are fixed (already confirmed on Bitcoin) but the local builder
+        /// would produce different bytes (e.g. different PIR set). Cardano TM datum will contain
+        /// these bytes; Bitcoin broadcast is skipped regardless of `bitcoin.submit`.
+        #[arg(long)]
+        existing_tm_hex: Option<String>,
     },
 }
 
@@ -349,6 +355,7 @@ fn main() {
             treasury_outpoint,
             treasury_amount_sat,
             broadcast,
+            existing_tm_hex,
         } => {
             let cfg = load_config(config.as_deref());
             if let Err(e) = run_sweep_pegins(
@@ -360,6 +367,7 @@ fn main() {
                 &treasury_outpoint,
                 treasury_amount_sat,
                 broadcast,
+                existing_tm_hex.as_deref(),
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -731,6 +739,7 @@ fn run_sweep_pegins(
     treasury_outpoint: &str,
     treasury_amount_sat: u64,
     broadcast: bool,
+    existing_tm_hex: Option<&str>,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, OutPoint, ScriptBuf};
@@ -834,7 +843,17 @@ fn run_sweep_pegins(
 
     let signed = sign_tm_single_key(&secp, &unsigned, &sk)
         .map_err(|e| format!("sign sweep: {e}"))?;
-    let raw = bitcoin::consensus::encode::serialize(&signed);
+    let mut raw = bitcoin::consensus::encode::serialize(&signed);
+    if let Some(hex_str) = existing_tm_hex {
+        let bytes = hex::decode(hex_str.trim())
+            .map_err(|e| format!("existing_tm_hex: {e}"))?;
+        println!(
+            "  [override] using existing TM bytes ({} bytes hex={}…)",
+            bytes.len(),
+            &hex_str.trim()[..hex_str.len().min(20)]
+        );
+        raw = bytes;
+    }
 
     println!("\n── Treasury Movement (sweep peg-ins) ──");
     println!("  txid:    {}", signed.compute_txid());
