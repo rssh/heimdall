@@ -177,7 +177,11 @@ fn run() -> Result<(), String> {
         }
         None => {
             let rpc = build_rpc(&cfg)?;
-            let utxos = rt.block_on(discover_utxos(&rpc, &depositor_p2wpkh.to_string()))?;
+            // One `Client` for the whole discovery + broadcast chain so reqwest pools the
+            // bitcoind RPC connection across `listunspent` / `scantxoutset` / `sendrawtransaction`.
+            let http = reqwest::Client::new();
+            let utxos =
+                rt.block_on(discover_utxos(&http, &rpc, &depositor_p2wpkh.to_string()))?;
             if utxos.is_empty() {
                 return Err(format!(
                     "no UTXOs found at {depositor_p2wpkh}. Fund the address and retry."
@@ -394,14 +398,18 @@ fn build_rpc(cfg: &HeimdallConfig) -> Result<BtcRpcConfig, String> {
 /// Try `listunspent` filtered by address; if it returns empty or the
 /// wallet isn't usable (no wallet loaded / multiple wallets unselected),
 /// fall back to `scantxoutset addr(...)`. Returns owned, spendable UTXOs.
-async fn discover_utxos(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, String> {
-    let via_wallet = list_unspent(rpc, address).await?;
+async fn discover_utxos(
+    client: &reqwest::Client,
+    rpc: &BtcRpcConfig,
+    address: &str,
+) -> Result<Vec<Utxo>, String> {
+    let via_wallet = list_unspent(client, rpc, address).await?;
     if !via_wallet.is_empty() {
         eprintln!("discovered {} UTXO(s) via listunspent", via_wallet.len());
         return Ok(via_wallet);
     }
     eprintln!("listunspent unavailable or empty; falling back to scantxoutset (slower)");
-    let via_scan = scan_utxos(rpc, address).await?;
+    let via_scan = scan_utxos(client, rpc, address).await?;
     eprintln!("discovered {} UTXO(s) via scantxoutset", via_scan.len());
     Ok(via_scan)
 }
@@ -415,14 +423,18 @@ fn rpc_error_code(json: &serde_json::Value) -> Option<i64> {
         .and_then(|c| c.as_i64())
 }
 
-async fn list_unspent(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, String> {
+async fn list_unspent(
+    client: &reqwest::Client,
+    rpc: &BtcRpcConfig,
+    address: &str,
+) -> Result<Vec<Utxo>, String> {
     let body = serde_json::json!({
         "jsonrpc": "1.0",
         "id": "depositor",
         "method": "listunspent",
         "params": [1, 9999999, [address]]
     });
-    let json = rpc_call(rpc, body).await?;
+    let json = rpc_call(client, rpc, body).await?;
 
     // -18 RPC_WALLET_NOT_FOUND  (no wallet is loaded)
     // -19 RPC_WALLET_NOT_SPECIFIED (multiple wallets, none selected)
@@ -468,7 +480,11 @@ async fn list_unspent(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, St
     Ok(out)
 }
 
-async fn scan_utxos(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, String> {
+async fn scan_utxos(
+    client: &reqwest::Client,
+    rpc: &BtcRpcConfig,
+    address: &str,
+) -> Result<Vec<Utxo>, String> {
     let descriptor = format!("addr({address})");
     let body = serde_json::json!({
         "jsonrpc": "1.0",
@@ -476,7 +492,7 @@ async fn scan_utxos(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, Stri
         "method": "scantxoutset",
         "params": ["start", [descriptor]]
     });
-    let json = rpc_call(rpc, body).await?;
+    let json = rpc_call(client, rpc, body).await?;
     if rpc_error_code(&json).is_some() {
         return Err(format!("scantxoutset rpc error: {}", json["error"]));
     }
@@ -511,22 +527,33 @@ async fn scan_utxos(rpc: &BtcRpcConfig, address: &str) -> Result<Vec<Utxo>, Stri
 /// returns HTTP 500 with a structured `error` body for RPC-level failures
 /// (e.g. -18 "No wallet is loaded"), so this helper does NOT treat a
 /// JSON-level error as fatal — callers inspect `json["error"]` to decide
-/// whether a given code is recoverable (see `list_unspent`).
+/// whether a given code is recoverable (see `list_unspent`). For 4xx /
+/// non-500 5xx (e.g. 401 from missing/incorrect auth), Bitcoin Core returns
+/// a non-JSON body; we short-circuit before the JSON parse so the caller
+/// sees a precise status code instead of a generic `rpc parse` error.
 ///
-/// Demo-only: this builds a fresh `reqwest::Client` per call (no connection
-/// pooling) and assumes the response body is JSON, so an auth failure (HTTP
-/// 401/403, non-JSON body) surfaces as a generic `rpc parse` error rather than
-/// a precise diagnostic. Acceptable for the depositor test-utility; a
-/// production RPC client would reuse one `Client` and branch on `resp.status()`.
+/// The `client` is shared across calls so reqwest can pool the connection —
+/// `discover_utxos` does back-to-back `listunspent` + `scantxoutset`, and
+/// `run` chains a broadcast on top.
 async fn rpc_call(
+    client: &reqwest::Client,
     rpc: &BtcRpcConfig,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let mut req = reqwest::Client::new().post(&rpc.url).json(&body);
+    let mut req = client.post(&rpc.url).json(&body);
     if let (Some(user), Some(pass)) = (&rpc.user, &rpc.pass) {
         req = req.basic_auth(user, Some(pass));
     }
     let resp = req.send().await.map_err(|e| format!("rpc send: {e}"))?;
+    let status = resp.status();
+    // Only HTTP 200 and HTTP 500 (Bitcoin Core's structured RPC-error path) carry JSON. Anything
+    // else (401/403 from auth, 404 from a bad URL, etc.) returns plain text or HTML; surface the
+    // status so the operator sees the cause directly instead of chasing a "rpc parse" error.
+    if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("rpc http {status}: {snippet}"));
+    }
     let json: serde_json::Value = resp.json().await.map_err(|e| format!("rpc parse: {e}"))?;
     Ok(json)
 }

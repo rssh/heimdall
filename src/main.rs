@@ -742,7 +742,7 @@ fn run_sweep_pegins(
     existing_tm_hex: Option<&str>,
 ) -> Result<(), String> {
     use bitcoin::key::Secp256k1;
-    use bitcoin::{Amount, OutPoint, ScriptBuf};
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, PegInInput, TreasuryInput};
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
@@ -843,22 +843,36 @@ fn run_sweep_pegins(
 
     let signed = sign_tm_single_key(&secp, &unsigned, &sk)
         .map_err(|e| format!("sign sweep: {e}"))?;
-    let mut raw = bitcoin::consensus::encode::serialize(&signed);
-    if let Some(hex_str) = existing_tm_hex {
-        let bytes = hex::decode(hex_str.trim())
-            .map_err(|e| format!("existing_tm_hex: {e}"))?;
-        println!(
-            "  [override] using existing TM bytes ({} bytes hex={}…)",
-            bytes.len(),
-            &hex_str.trim()[..hex_str.len().min(20)]
-        );
-        raw = bytes;
-    }
+    let local_raw = bitcoin::consensus::encode::serialize(&signed);
+    // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
+    // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)
+    // reflects the bytes Cardano will actually see — operators would otherwise copy-paste the
+    // wrong txid from the locally-signed value.
+    let (effective_tx, raw, override_in_effect): (Transaction, Vec<u8>, bool) =
+        if let Some(hex_str) = existing_tm_hex {
+            let trimmed = hex_str.trim();
+            let bytes = hex::decode(trimmed)
+                .map_err(|e| format!("existing_tm_hex: {e}"))?;
+            let tx: Transaction = bitcoin::consensus::deserialize(&bytes).map_err(|e| {
+                format!("existing_tm_hex: not a valid Bitcoin transaction: {e}")
+            })?;
+            // Slice into `trimmed` (not the un-trimmed `hex_str`) — otherwise leading/trailing
+            // whitespace makes `hex_str.len()` bigger than `trimmed.len()` and the slice panics.
+            let preview_end = trimmed.len().min(20);
+            println!(
+                "  [override] using existing TM bytes ({} bytes hex={}…)",
+                bytes.len(),
+                &trimmed[..preview_end]
+            );
+            (tx, bytes, true)
+        } else {
+            (signed, local_raw, false)
+        };
 
     println!("\n── Treasury Movement (sweep peg-ins) ──");
-    println!("  txid:    {}", signed.compute_txid());
-    println!("  inputs:  {}", signed.input.len());
-    for (i, (inp, prevout)) in signed.input.iter().zip(unsigned.prevouts.iter()).enumerate() {
+    println!("  txid:    {}", effective_tx.compute_txid());
+    println!("  inputs:  {}", effective_tx.input.len());
+    for (i, (inp, prevout)) in effective_tx.input.iter().zip(unsigned.prevouts.iter()).enumerate() {
         println!(
             "    [{}] {}:{} — {} sat  script={}",
             i,
@@ -868,8 +882,8 @@ fn run_sweep_pegins(
             hex::encode(prevout.script_pubkey.as_bytes()),
         );
     }
-    println!("  outputs: {}", signed.output.len());
-    for (i, out) in signed.output.iter().enumerate() {
+    println!("  outputs: {}", effective_tx.output.len());
+    for (i, out) in effective_tx.output.iter().enumerate() {
         println!(
             "    [{}] {} sat  script={}",
             i,
@@ -877,7 +891,10 @@ fn run_sweep_pegins(
             hex::encode(out.script_pubkey.as_bytes()),
         );
     }
-    println!("  output[0] (new treasury): {} sat", signed.output[0].value.to_sat());
+    println!(
+        "  output[0] (new treasury): {} sat",
+        effective_tx.output[0].value.to_sat()
+    );
     println!("  size:    {} bytes", raw.len());
     println!("  hex:     {}", hex::encode(&raw));
 
@@ -937,8 +954,16 @@ fn run_sweep_pegins(
                 cfg.bitcoin.rpc_pass.clone(),
             );
         }
+        // Honor the documented contract: when the BTC TM bytes come from `--existing-tm-hex`,
+        // the tx is already on Bitcoin (and would be a double-spend), so DON'T let the chain
+        // re-broadcast it regardless of how `bitcoin.submit` is set in the config.
+        let bitcoin_submit = if override_in_effect {
+            false
+        } else {
+            cfg.bitcoin.submit
+        };
         chain = chain.with_submit_config(
-            cfg.bitcoin.submit,
+            bitcoin_submit,
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );

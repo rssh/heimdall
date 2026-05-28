@@ -355,10 +355,19 @@ pub fn sign_tm_single_key(
     let sighashes = compute_sighashes(unsigned);
     let keypair = Keypair::from_secret_key(secp, secret);
     let mut tx = unsigned.tx.clone();
-    for (i, txin) in tx.input.iter_mut().enumerate() {
-        let merkle_root = unsigned.input_spend_info[i].merkle_root();
+    // Zip the three same-length slices so witness assembly carries no `[i]` indexing — the
+    // MalformedUnsignedTm guard above already proves the lengths agree, but iterator-zip makes
+    // the absence of any panic site syntactically obvious (and stays correct if a future caller
+    // bypasses the guard).
+    for ((txin, spend_info), sighash) in tx
+        .input
+        .iter_mut()
+        .zip(unsigned.input_spend_info.iter())
+        .zip(sighashes.iter())
+    {
+        let merkle_root = spend_info.merkle_root();
         let tweaked = keypair.tap_tweak(secp, merkle_root);
-        let msg = Message::from_digest(sighashes[i]);
+        let msg = Message::from_digest(*sighash);
         let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         let tap_sig = bitcoin::taproot::Signature {
             signature: sig,
