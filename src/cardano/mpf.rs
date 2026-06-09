@@ -372,6 +372,417 @@ fn do_fork(
     )
 }
 
+// ===========================================================================
+// Phase 2 — off-chain trie + proof generation
+//
+// The full key/value store that maintains the trie and *generates* the proofs
+// the Phase 1 verifier (and the on-chain Aiken validator) consume. Ported from
+// the scalus off-chain `MerklePatriciaForestry` (scalus-core
+// crypto/trie/MerklePatriciaForestry{,Base}.scala). register_spo (R1c) calls
+// `prove_non_membership` for the `bifrost_identity_absence_proof`.
+//
+// Validation strategy: the proofs this produces are checked end-to-end against
+// the byte-exact Phase 1 verifier (`including`/`excluding`), which is itself
+// validated against the Aiken library's vectors — so a self-consistent prover
+// here is Aiken-compatible.
+//
+// NOTE (Phase 2 hardening): node hashes are recomputed on demand (no memoised
+// cache as in the scalus original); fine for the small rosters register_spo
+// builds, revisit if used on large tries. `do_insert` panics on a duplicate
+// key (mirrors the scalus `throw`); convert to `Result` with the rest of the
+// hardening pass.
+// ===========================================================================
+
+/// blake2b-256 of a key/value yields a 32-byte path → 64 nibbles deep.
+const PATH_NIBBLES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpfError {
+    /// `prove_non_membership` called on a key already in the trie.
+    KeyPresent,
+    /// `prove_membership` called on a key absent from the trie.
+    KeyAbsent,
+}
+
+/// A trie node. Radix-16 Patricia with prefix (`skip`) compression.
+#[derive(Clone)]
+enum Node {
+    Empty,
+    /// `full_path = blake2b_256(key)`; `skip_start` is the cursor at creation.
+    Leaf {
+        skip_start: usize,
+        full_path: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// `rep_path` is any descendant leaf's full path (used to read prefix nibbles).
+    Branch {
+        skip_start: usize,
+        skip_len: usize,
+        rep_path: Vec<u8>,
+        children: Vec<Node>, // length 16
+        size: usize,
+    },
+}
+
+fn empty_children() -> Vec<Node> {
+    vec![Node::Empty; 16]
+}
+
+impl Node {
+    fn hash(&self) -> Hash {
+        match self {
+            Node::Empty => NULL_HASH,
+            Node::Leaf {
+                skip_start,
+                full_path,
+                value,
+            } => combine(&suffix(full_path, *skip_start), &blake2b_256(value)),
+            Node::Branch {
+                skip_start,
+                skip_len,
+                rep_path,
+                children,
+                ..
+            } => combine(
+                &nibbles(rep_path, *skip_start, *skip_start + *skip_len),
+                &merkle_root_16(children),
+            ),
+        }
+    }
+}
+
+/// Merkle root of 16 child hashes — the binary tree of `combine` that on-chain
+/// `merkle_16` reconstructs (16 → 8 → 4 → 2 → 1).
+fn merkle_root_16(children: &[Node]) -> Hash {
+    debug_assert_eq!(children.len(), 16, "merkle_root_16 expects exactly 16 children");
+    let mut level: Vec<Hash> = children.iter().map(Node::hash).collect();
+    while level.len() > 1 {
+        level = level.chunks(2).map(|p| combine(&p[0], &p[1])).collect();
+    }
+    level[0]
+}
+
+/// The 4 sibling hashes (`neighbor8 ‖ neighbor4 ‖ neighbor2 ‖ neighbor1`, 128
+/// bytes) for a Branch proof step, via bit-flip indexing (scalus `merkleProof4`).
+fn merkle_proof_4(children: &[Node], branch: usize) -> Vec<u8> {
+    let s1 = children[branch ^ 1].hash();
+
+    let p = ((branch >> 1) ^ 1) << 1;
+    let s2 = combine(&children[p].hash(), &children[p + 1].hash());
+
+    let q = ((branch >> 2) ^ 1) << 2;
+    let s4 = combine(
+        &combine(&children[q].hash(), &children[q + 1].hash()),
+        &combine(&children[q + 2].hash(), &children[q + 3].hash()),
+    );
+
+    let o = ((branch >> 3) ^ 1) << 3;
+    let s8 = combine(
+        &combine(
+            &combine(&children[o].hash(), &children[o + 1].hash()),
+            &combine(&children[o + 2].hash(), &children[o + 3].hash()),
+        ),
+        &combine(
+            &combine(&children[o + 4].hash(), &children[o + 5].hash()),
+            &combine(&children[o + 6].hash(), &children[o + 7].hash()),
+        ),
+    );
+
+    let mut out = Vec::with_capacity(4 * DIGEST);
+    out.extend_from_slice(&s8);
+    out.extend_from_slice(&s4);
+    out.extend_from_slice(&s2);
+    out.extend_from_slice(&s1);
+    out
+}
+
+fn common_prefix_len(a: &[u8], b: &[u8], start: usize, end: usize) -> usize {
+    let mut i = start;
+    while i < end && nibble(a, i) == nibble(b, i) {
+        i += 1;
+    }
+    i - start
+}
+
+fn branch_skip_matches_path(rep_path: &[u8], skip_len: usize, path: &[u8], cursor: usize) -> bool {
+    (0..skip_len).all(|i| nibble(rep_path, cursor + i) == nibble(path, cursor + i))
+}
+
+fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Node {
+    match node {
+        Node::Empty => Node::Leaf {
+            skip_start: cursor,
+            full_path: path.to_vec(),
+            value: value.to_vec(),
+        },
+
+        Node::Leaf {
+            full_path: leaf_path,
+            value: leaf_value,
+            ..
+        } => {
+            let remaining_len = PATH_NIBBLES - cursor;
+            let cp = common_prefix_len(path, leaf_path, cursor, PATH_NIBBLES);
+            assert!(cp != remaining_len, "key already in trie");
+
+            let new_nibble = nibble(path, cursor + cp) as usize;
+            let old_nibble = nibble(leaf_path, cursor + cp) as usize;
+            let split_cursor = cursor + cp + 1;
+
+            let mut children = empty_children();
+            children[new_nibble] = Node::Leaf {
+                skip_start: split_cursor,
+                full_path: path.to_vec(),
+                value: value.to_vec(),
+            };
+            children[old_nibble] = Node::Leaf {
+                skip_start: split_cursor,
+                full_path: leaf_path.clone(),
+                value: leaf_value.clone(),
+            };
+            Node::Branch {
+                skip_start: cursor,
+                skip_len: cp,
+                rep_path: path.to_vec(),
+                children,
+                size: 2,
+            }
+        }
+
+        Node::Branch {
+            skip_start,
+            skip_len,
+            rep_path,
+            children,
+            size,
+        } => {
+            let cp = common_prefix_len(path, rep_path, cursor, cursor + skip_len);
+            if cp < *skip_len {
+                // Path diverges inside the branch's prefix → split the branch.
+                let split_cursor = cursor + cp + 1;
+                let new_nibble = nibble(path, cursor + cp) as usize;
+                let old_nibble = nibble(rep_path, cursor + cp) as usize;
+
+                let mut new_children = empty_children();
+                new_children[new_nibble] = Node::Leaf {
+                    skip_start: split_cursor,
+                    full_path: path.to_vec(),
+                    value: value.to_vec(),
+                };
+                new_children[old_nibble] = Node::Branch {
+                    skip_start: skip_start + cp + 1,
+                    skip_len: skip_len - cp - 1,
+                    rep_path: rep_path.clone(),
+                    children: children.clone(),
+                    size: *size,
+                };
+                Node::Branch {
+                    skip_start: cursor,
+                    skip_len: cp,
+                    rep_path: path.to_vec(),
+                    children: new_children,
+                    size: size + 1,
+                }
+            } else {
+                // Prefix matches → descend into the child.
+                let child_nibble = nibble(path, cursor + skip_len) as usize;
+                let child_cursor = cursor + skip_len + 1;
+                let new_child = do_insert(&children[child_nibble], path, child_cursor, value);
+                let mut new_children = children.clone();
+                new_children[child_nibble] = new_child;
+                Node::Branch {
+                    skip_start: *skip_start,
+                    skip_len: *skip_len,
+                    rep_path: rep_path.clone(),
+                    children: new_children,
+                    size: size + 1,
+                }
+            }
+        }
+    }
+}
+
+fn do_get(node: &Node, path: &[u8], cursor: usize) -> Option<Vec<u8>> {
+    match node {
+        Node::Empty => None,
+        Node::Leaf {
+            full_path, value, ..
+        } => (full_path.as_slice() == path).then(|| value.clone()),
+        Node::Branch {
+            skip_len,
+            rep_path,
+            children,
+            ..
+        } => {
+            if !branch_skip_matches_path(rep_path, *skip_len, path, cursor) {
+                None
+            } else {
+                let child_nibble = nibble(path, cursor + skip_len) as usize;
+                do_get(&children[child_nibble], path, cursor + skip_len + 1)
+            }
+        }
+    }
+}
+
+/// Walk root→leaf collecting one proof step per branch (root-first order).
+/// Returns `(found, steps)` where `found` is whether the leaf matches `path`.
+fn do_prove(node: &Node, path: &[u8], cursor: usize) -> (bool, Vec<ProofStep>) {
+    match node {
+        Node::Empty => (false, Vec::new()),
+        Node::Leaf { full_path, .. } => (full_path.as_slice() == path, Vec::new()),
+        Node::Branch {
+            skip_len, children, ..
+        } => {
+            let child_nibble = nibble(path, cursor + skip_len) as usize;
+            let child = &children[child_nibble];
+            let (found, child_steps) = match child {
+                Node::Empty => (false, Vec::new()),
+                _ => do_prove(child, path, cursor + skip_len + 1),
+            };
+            let step = make_proof_step(children, child_nibble, *skip_len);
+            let mut steps = Vec::with_capacity(child_steps.len() + 1);
+            steps.push(step);
+            steps.extend(child_steps);
+            (found, steps)
+        }
+    }
+}
+
+/// The most compact proof step for a branch, by sibling count (scalus
+/// `makeProofStep`): ≥2 siblings → `Branch` (sparse-merkle 4-hash); exactly 1
+/// → `Leaf`/`Fork`.
+fn make_proof_step(children: &[Node], target_index: usize, skip: usize) -> ProofStep {
+    let siblings: Vec<usize> = (0..16)
+        .filter(|&i| i != target_index && !matches!(children[i], Node::Empty))
+        .collect();
+
+    if siblings.len() >= 2 {
+        ProofStep::Branch {
+            skip,
+            neighbors: merkle_proof_4(children, target_index),
+        }
+    } else if siblings.len() == 1 {
+        let nidx = siblings[0];
+        match &children[nidx] {
+            Node::Leaf {
+                full_path, value, ..
+            } => ProofStep::Leaf {
+                skip,
+                key: full_path.clone(),
+                value: blake2b_256(value).to_vec(),
+            },
+            Node::Branch {
+                skip_start,
+                skip_len,
+                rep_path,
+                children: inner,
+                ..
+            } => ProofStep::Fork {
+                skip,
+                neighbor: Neighbor {
+                    nibble: nidx as u8,
+                    prefix: nibbles(rep_path, *skip_start, *skip_start + *skip_len),
+                    root: merkle_root_16(inner).to_vec(),
+                },
+            },
+            Node::Empty => unreachable!("filtered out above"),
+        }
+    } else {
+        unreachable!("a branch always has >= 2 descendants")
+    }
+}
+
+/// An off-chain Merkle Patricia Forestry trie: a key/value store that generates
+/// on-chain-compatible inclusion / exclusion proofs.
+#[derive(Clone)]
+pub struct Trie {
+    root: Node,
+}
+
+impl Default for Trie {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl Trie {
+    #[must_use]
+    pub fn empty() -> Self {
+        Trie { root: Node::Empty }
+    }
+
+    /// Build a trie from `(key, value)` pairs (keys must be distinct).
+    #[must_use]
+    pub fn from_pairs(entries: &[(Vec<u8>, Vec<u8>)]) -> Self {
+        let mut t = Trie::empty();
+        for (k, v) in entries {
+            t = t.insert(k, v);
+        }
+        t
+    }
+
+    /// The 32-byte root hash — compare against the on-chain `bifrost_identity_root`.
+    #[must_use]
+    pub fn root_hash(&self) -> Hash {
+        self.root.hash()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self.root, Node::Empty)
+    }
+
+    /// Number of elements in the trie.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match &self.root {
+            Node::Empty => 0,
+            Node::Leaf { .. } => 1,
+            Node::Branch { size, .. } => *size,
+        }
+    }
+
+    /// Insert `key → value`. Panics if `key` is already present.
+    #[must_use]
+    pub fn insert(&self, key: &[u8], value: &[u8]) -> Trie {
+        let path = blake2b_256(key);
+        Trie {
+            root: do_insert(&self.root, &path, 0, value),
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        do_get(&self.root, &blake2b_256(key), 0)
+    }
+
+    /// A proof that `key` maps to its stored value. Verify with
+    /// `including(key, value, &proof) == root_hash()`.
+    pub fn prove_membership(&self, key: &[u8]) -> Result<Proof, MpfError> {
+        let path = blake2b_256(key);
+        let (found, steps) = do_prove(&self.root, &path, 0);
+        if found {
+            Ok(steps)
+        } else {
+            Err(MpfError::KeyAbsent)
+        }
+    }
+
+    /// A proof that `key` is absent (the `bifrost_identity_absence_proof`).
+    /// Verify with `excluding(key, &proof) == root_hash()`; after registering,
+    /// `including(key, new_value, &proof)` is the updated root.
+    pub fn prove_non_membership(&self, key: &[u8]) -> Result<Proof, MpfError> {
+        if self.get(key).is_some() {
+            return Err(MpfError::KeyPresent);
+        }
+        // Insert under a dummy value, then prove membership in the expanded trie.
+        // The proof carries only neighbors (not the target leaf's value), so the
+        // dummy is irrelevant: `excluding` rebuilds the original root, `including`
+        // the post-insert root.
+        self.insert(key, &[]).prove_membership(key)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tests — validated against the Aiken library's own vectors
 // ---------------------------------------------------------------------------
@@ -532,6 +943,100 @@ mod tests {
             "9e36f867a374be",
             &proof,
             "b76dd0926602d6e9d28a0b3707db4622184d59c7392f5a0469bf775d9aa05f33",
+        );
+    }
+
+    // ----- Phase 2: off-chain trie / proof generation -----
+
+    fn sample_pairs(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("spo-{i}").into_bytes(),
+                    format!("pool-{i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trie_empty_root_is_null() {
+        assert!(Trie::empty().is_empty());
+        assert_eq!(Trie::empty().root_hash(), NULL_HASH);
+    }
+
+    // A one-leaf trie's root must equal the verifier's empty-proof inclusion —
+    // cross-checks the prover's root against the Aiken-validated verifier.
+    #[test]
+    fn trie_single_element_matches_empty_proof() {
+        let t = Trie::empty().insert(b"spo-0", b"pool-0");
+        assert_eq!(t.root_hash(), including(b"spo-0", b"pool-0", &vec![]));
+        assert_eq!(t.get(b"spo-0"), Some(b"pool-0".to_vec()));
+        assert_eq!(t.get(b"spo-1"), None);
+        assert_eq!(t.prove_membership(b"spo-0"), Ok(vec![]));
+    }
+
+    // Every membership proof must verify under `including` against the root —
+    // 30 keys exercise Branch / Fork / Leaf proof steps as they arise.
+    #[test]
+    fn trie_membership_proofs_verify_for_all_keys() {
+        let pairs = sample_pairs(30);
+        let t = Trie::from_pairs(&pairs);
+        assert_eq!(t.len(), 30);
+        assert_eq!(t.get(b"spo-7"), Some(b"pool-7".to_vec()));
+        for (k, v) in &pairs {
+            let proof = t.prove_membership(k).expect("key present");
+            assert_eq!(
+                including(k, v, &proof),
+                t.root_hash(),
+                "inclusion proof for {k:?} must rebuild the root"
+            );
+        }
+    }
+
+    // The absence proof: `excluding` rebuilds the original root, `including`
+    // (with the real value) the post-insert root — exactly the register_spo flow.
+    #[test]
+    fn trie_non_membership_proof_round_trips() {
+        let t = Trie::from_pairs(&sample_pairs(30));
+        let key = b"spo-new";
+        let value = b"pool-new";
+        assert!(t.get(key).is_none());
+
+        let proof = t.prove_non_membership(key).expect("key absent");
+        assert_eq!(excluding(key, &proof), t.root_hash(), "exclusion == old root");
+        assert_eq!(
+            including(key, value, &proof),
+            t.insert(key, value).root_hash(),
+            "inclusion == new root after registering key→value"
+        );
+    }
+
+    #[test]
+    fn trie_prove_error_cases() {
+        let t = Trie::from_pairs(&sample_pairs(5));
+        assert_eq!(t.prove_membership(b"spo-absent"), Err(MpfError::KeyAbsent));
+        assert_eq!(t.prove_non_membership(b"spo-0"), Err(MpfError::KeyPresent));
+    }
+
+    // make_proof_step's Fork arm (single sibling that is itself a Branch) only
+    // arises in larger tries — the 30-key tests produce none. Exercise it
+    // explicitly so the prover-side Fork construction (which register_spo's
+    // absence proof relies on for deeper rosters) is covered end-to-end.
+    #[test]
+    fn trie_large_trie_exercises_fork_steps() {
+        let pairs = sample_pairs(200);
+        let t = Trie::from_pairs(&pairs);
+        assert_eq!(t.len(), 200);
+        let mut fork_seen = false;
+        for (k, v) in &pairs {
+            let proof = t.prove_membership(k).expect("key present");
+            assert_eq!(including(k, v, &proof), t.root_hash(), "inclusion for {k:?}");
+            fork_seen |= proof.iter().any(|s| matches!(s, ProofStep::Fork { .. }));
+        }
+        assert!(
+            fork_seen,
+            "a 200-key trie should generate at least one Fork proof step"
         );
     }
 }
