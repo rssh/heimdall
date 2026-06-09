@@ -15,6 +15,7 @@ pub mod blockfrost_chain;
 pub mod btc_rpc;
 pub mod blockfrost_source;
 pub mod mock;
+pub mod mpf;
 pub mod pallas_source;
 pub mod pegin_datum;
 pub mod pegin_source;
