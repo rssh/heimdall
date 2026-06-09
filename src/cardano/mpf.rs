@@ -22,8 +22,7 @@
 //! on-chain lib; reference the `aiken-lang/merkle-patricia-forestry` `off-chain` (TS) package
 //! or the scalus `AikenMpfData` port.
 
-use std::cell::OnceCell;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use pallas_crypto::hash::Hasher;
 
@@ -478,11 +477,10 @@ fn do_fork(
 // NOTE (WI-007 hardening): the verifier (`including`/`excluding`) validates an
 // untrusted proof up front (`validate_proof`) and returns `Result` instead of
 // panicking; `do_insert` returns `Err(KeyPresent)` on a duplicate key; node
-// hashes are memoised (`OnceCell`). Still deferred (WI-007): fewer per-insert
-// children clones (`do_insert` deep-clones the children Vec per level — O(N²)
-// build, fine for the small rosters register_spo builds; an Rc-shared node
-// representation would make it O(N·depth)), `do_delete` (deregister), fixed-size
-// proof types, and an iterator `from_pairs`.
+// hashes are memoised (`OnceLock`) and children are `Arc`-shared so an insert
+// clones cheap pointers rather than deep-copying subtrees. Still deferred
+// (WI-007): `do_delete` (deregister), fixed-size proof types, and an iterator
+// `from_pairs`.
 // ===========================================================================
 
 /// blake2b-256 of a key/value yields a 32-byte path → 64 nibbles deep.
@@ -512,12 +510,11 @@ pub enum MpfError {
 
 /// A trie node. Radix-16 Patricia with prefix (`skip`) compression.
 ///
-/// `hash` memoises the node digest (computed once on first access, like the
-/// scalus `lazy val hash`) so building/proving never re-hashes whole subtrees.
-/// A cloned node carries its cached hash; only nodes rebuilt on the insert path
-/// recompute. (`OnceCell` is `!Sync` but `Send`, which is all the single-thread
-/// build-then-prove flow needs.)
-#[derive(Clone)]
+/// Children are `Arc`-shared so rebuilding the insert path clones cheap pointers
+/// rather than deep-copying subtrees (O(N·depth) build instead of O(N²)). `hash`
+/// memoises the node digest in a `OnceLock` (computed once on first access, like
+/// the scalus `lazy val hash`) so building/proving never re-hashes whole
+/// subtrees. `Arc<Node>` + `OnceLock` keeps `Trie` `Send + Sync`.
 enum Node {
     Empty,
     /// `full_path = blake2b_256(key)`; `skip_start` is the cursor at creation.
@@ -525,48 +522,49 @@ enum Node {
         skip_start: usize,
         full_path: Vec<u8>,
         value: Vec<u8>,
-        hash: OnceCell<Hash>,
+        hash: OnceLock<Hash>,
     },
     /// `rep_path` is any descendant leaf's full path (used to read prefix nibbles).
     Branch {
         skip_start: usize,
         skip_len: usize,
         rep_path: Vec<u8>,
-        children: Vec<Node>, // length 16
+        children: Vec<Arc<Node>>, // length 16
         size: usize,
-        hash: OnceCell<Hash>,
+        hash: OnceLock<Hash>,
     },
 }
 
-fn empty_children() -> Vec<Node> {
-    vec![Node::Empty; 16]
+fn empty_children() -> Vec<Arc<Node>> {
+    let empty = Arc::new(Node::Empty);
+    vec![empty; 16]
 }
 
 impl Node {
-    fn leaf(skip_start: usize, full_path: Vec<u8>, value: Vec<u8>) -> Node {
-        Node::Leaf {
+    fn leaf(skip_start: usize, full_path: Vec<u8>, value: Vec<u8>) -> Arc<Node> {
+        Arc::new(Node::Leaf {
             skip_start,
             full_path,
             value,
-            hash: OnceCell::new(),
-        }
+            hash: OnceLock::new(),
+        })
     }
 
     fn branch(
         skip_start: usize,
         skip_len: usize,
         rep_path: Vec<u8>,
-        children: Vec<Node>,
+        children: Vec<Arc<Node>>,
         size: usize,
-    ) -> Node {
-        Node::Branch {
+    ) -> Arc<Node> {
+        Arc::new(Node::Branch {
             skip_start,
             skip_len,
             rep_path,
             children,
             size,
-            hash: OnceCell::new(),
-        }
+            hash: OnceLock::new(),
+        })
     }
 
     fn hash(&self) -> Hash {
@@ -598,9 +596,9 @@ impl Node {
 
 /// Merkle root of 16 child hashes — the binary tree of `combine` that on-chain
 /// `merkle_16` reconstructs (16 → 8 → 4 → 2 → 1).
-fn merkle_root_16(children: &[Node]) -> Hash {
+fn merkle_root_16(children: &[Arc<Node>]) -> Hash {
     debug_assert_eq!(children.len(), 16, "merkle_root_16 expects exactly 16 children");
-    let mut level: Vec<Hash> = children.iter().map(Node::hash).collect();
+    let mut level: Vec<Hash> = children.iter().map(|c| c.hash()).collect();
     while level.len() > 1 {
         level = level.chunks(2).map(|p| combine(&p[0], &p[1])).collect();
     }
@@ -609,7 +607,7 @@ fn merkle_root_16(children: &[Node]) -> Hash {
 
 /// The 4 sibling hashes (`neighbor8 ‖ neighbor4 ‖ neighbor2 ‖ neighbor1`, 128
 /// bytes) for a Branch proof step, via bit-flip indexing (scalus `merkleProof4`).
-fn merkle_proof_4(children: &[Node], branch: usize) -> Vec<u8> {
+fn merkle_proof_4(children: &[Arc<Node>], branch: usize) -> Vec<u8> {
     let s1 = children[branch ^ 1].hash();
 
     let p = ((branch >> 1) ^ 1) << 1;
@@ -653,7 +651,7 @@ fn branch_skip_matches_path(rep_path: &[u8], skip_len: usize, path: &[u8], curso
     (0..skip_len).all(|i| nibble(rep_path, cursor + i) == nibble(path, cursor + i))
 }
 
-fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Node, MpfError> {
+fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Arc<Node>, MpfError> {
     match node {
         Node::Empty => Ok(Node::leaf(cursor, path.to_vec(), value.to_vec())),
 
@@ -755,7 +753,7 @@ fn do_prove(node: &Node, path: &[u8], cursor: usize) -> (bool, Vec<ProofStep>) {
         } => {
             let child_nibble = nibble(path, cursor + skip_len) as usize;
             let child = &children[child_nibble];
-            let (found, child_steps) = match child {
+            let (found, child_steps) = match &**child {
                 Node::Empty => (false, Vec::new()),
                 _ => do_prove(child, path, cursor + skip_len + 1),
             };
@@ -771,9 +769,9 @@ fn do_prove(node: &Node, path: &[u8], cursor: usize) -> (bool, Vec<ProofStep>) {
 /// The most compact proof step for a branch, by sibling count (scalus
 /// `makeProofStep`): ≥2 siblings → `Branch` (sparse-merkle 4-hash); exactly 1
 /// → `Leaf`/`Fork`.
-fn make_proof_step(children: &[Node], target_index: usize, skip: usize) -> ProofStep {
+fn make_proof_step(children: &[Arc<Node>], target_index: usize, skip: usize) -> ProofStep {
     let siblings: Vec<usize> = (0..16)
-        .filter(|&i| i != target_index && !matches!(children[i], Node::Empty))
+        .filter(|&i| i != target_index && !matches!(*children[i], Node::Empty))
         .collect();
 
     if siblings.len() >= 2 {
@@ -783,7 +781,7 @@ fn make_proof_step(children: &[Node], target_index: usize, skip: usize) -> Proof
         }
     } else if siblings.len() == 1 {
         let nidx = siblings[0];
-        match &children[nidx] {
+        match &*children[nidx] {
             Node::Leaf {
                 full_path, value, ..
             } => ProofStep::Leaf {
@@ -816,7 +814,7 @@ fn make_proof_step(children: &[Node], target_index: usize, skip: usize) -> Proof
 /// on-chain-compatible inclusion / exclusion proofs.
 #[derive(Clone)]
 pub struct Trie {
-    root: Node,
+    root: Arc<Node>,
 }
 
 impl Default for Trie {
@@ -828,7 +826,9 @@ impl Default for Trie {
 impl Trie {
     #[must_use]
     pub fn empty() -> Self {
-        Trie { root: Node::Empty }
+        Trie {
+            root: Arc::new(Node::Empty),
+        }
     }
 
     /// Build a trie from `(key, value)` pairs. Returns `Err(KeyPresent)` on a duplicate key.
@@ -848,13 +848,13 @@ impl Trie {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        matches!(self.root, Node::Empty)
+        matches!(*self.root, Node::Empty)
     }
 
     /// Number of elements in the trie.
     #[must_use]
     pub fn len(&self) -> usize {
-        match &self.root {
+        match &*self.root {
             Node::Empty => 0,
             Node::Leaf { .. } => 1,
             Node::Branch { size, .. } => *size,
@@ -1231,5 +1231,14 @@ mod tests {
         );
         let new_root = t.insert(key, b"pool-new").unwrap().root_hash();
         assert_eq!(verify_inclusion(key, b"pool-new", &proof, &new_root), Ok(()));
+    }
+
+    // H4: Arc-shared nodes + OnceLock memoisation must keep Trie Send + Sync
+    // (so register_spo can hold it across an .await in an async flow).
+    #[test]
+    fn trie_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Trie>();
+        assert_send_sync::<MpfError>();
     }
 }
