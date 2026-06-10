@@ -25,6 +25,7 @@ pub mod publish;
 pub mod registry;
 pub mod treasury_bootstrap;
 pub mod treasury_datum;
+pub mod treasury_spend;
 pub mod treasury_info;
 pub mod wallet;
 
