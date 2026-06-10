@@ -181,25 +181,7 @@ impl BlockfrostCardanoChain {
         .await
         .map_err(|e| EpochError::Chain(format!("blockfrost wallet UTxO query: {e}")))?;
 
-        Ok(utxos
-            .iter()
-            .map(|u| {
-                let lovelace: u64 = u
-                    .amount
-                    .iter()
-                    .find(|a| a.unit == "lovelace")
-                    .map(|a| a.quantity.parse().unwrap_or(0))
-                    .unwrap_or(0);
-                // Pure ADA = the only amount entry is lovelace (no native tokens).
-                let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
-                WalletUtxo {
-                    tx_hash: u.tx_hash.clone(),
-                    output_index: u.output_index,
-                    lovelace,
-                    pure_ada,
-                }
-            })
-            .collect())
+        Ok(utxos.iter().map(WalletUtxo::from_bf).collect())
     }
 }
 

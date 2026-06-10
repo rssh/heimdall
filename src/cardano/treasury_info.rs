@@ -43,7 +43,10 @@ pub struct TreasuryInfoDatum {
 pub enum TreasuryInfoError {
     NotConstr,
     WrongConstructor(u64),
-    FieldCount { expected: usize, got: usize },
+    FieldCount {
+        expected: usize,
+        got: usize,
+    },
     NotBytes(usize),
     BadRootLen(usize),
     /// The off-chain trie's root does not match `current.bifrost_identity_root`,
@@ -83,12 +86,28 @@ fn int(n: i64) -> PlutusData {
 }
 
 /// A Plutus `Constr` with constructor index `c` (0..=6 → tag 121+c; 7+ → tag 102).
+///
+/// Fields use the CANONICAL plutus-core encoding: indefinite-length array when
+/// non-empty, definite empty (`0x80`) when empty. Haskell plutus-core is
+/// encoding-insensitive, but the Rust uplc evaluator (aiken/whisky/Mesh
+/// simulation) preserves the wire variant through decode and its `EqualsData` /
+/// `SerialiseData` are encoding-sensitive — a definite-encoded datum makes
+/// on-chain structural equality spuriously fail under Rust pre-validation.
 fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
-    let (tag, any_constructor) = if c <= 6 { (121 + c, None) } else { (102, Some(c)) };
+    let (tag, any_constructor) = if c <= 6 {
+        (121 + c, None)
+    } else {
+        (102, Some(c))
+    };
+    let fields = if fields.is_empty() {
+        MaybeIndefArray::Def(fields)
+    } else {
+        MaybeIndefArray::Indef(fields)
+    };
     PlutusData::Constr(Constr {
         tag,
         any_constructor,
-        fields: MaybeIndefArray::Def(fields),
+        fields,
     })
 }
 
@@ -188,8 +207,14 @@ pub fn treasury_spend_redeemer(config_ref_input_index: i64, new: &TreasuryInfoDa
 /// `SposRegistry.Register` redeemer's `bifrost_identity_absence_proof`.
 #[must_use]
 pub fn proof_to_plutus_data(proof: &mpf::Proof) -> PlutusData {
-    let steps = proof.iter().map(step_to_plutus_data).collect();
-    PlutusData::Array(MaybeIndefArray::Def(steps))
+    let steps: Vec<PlutusData> = proof.iter().map(step_to_plutus_data).collect();
+    // Canonical plutus-core list encoding: indefinite when non-empty (see `constr`).
+    let steps = if steps.is_empty() {
+        MaybeIndefArray::Def(steps)
+    } else {
+        MaybeIndefArray::Indef(steps)
+    };
+    PlutusData::Array(steps)
 }
 
 fn step_to_plutus_data(step: &mpf::ProofStep) -> PlutusData {
@@ -199,9 +224,10 @@ fn step_to_plutus_data(step: &mpf::ProofStep) -> PlutusData {
             constr(0, vec![int(*skip as i64), bytes(neighbors)])
         }
         // Fork { skip, neighbor }
-        mpf::ProofStep::Fork { skip, neighbor } => {
-            constr(1, vec![int(*skip as i64), neighbor_to_plutus_data(neighbor)])
-        }
+        mpf::ProofStep::Fork { skip, neighbor } => constr(
+            1,
+            vec![int(*skip as i64), neighbor_to_plutus_data(neighbor)],
+        ),
         // Leaf { skip, key, value }
         mpf::ProofStep::Leaf { skip, key, value } => {
             constr(2, vec![int(*skip as i64), bytes(key), bytes(value)])
@@ -263,7 +289,12 @@ mod tests {
 
     fn pairs(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         (0..n)
-            .map(|i| (format!("spo-{i}").into_bytes(), format!("pool-{i}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("spo-{i}").into_bytes(),
+                    format!("pool-{i}").into_bytes(),
+                )
+            })
             .collect()
     }
 
@@ -285,16 +316,37 @@ mod tests {
         assert_eq!(d, d2);
     }
 
+    // The datum must use the canonical plutus-core encoding (indefinite-length
+    // constr fields) — the Rust uplc evaluator compares encodings, so a
+    // definite-encoded datum fails `output_has_correct_datum` under simulation
+    // even though a Haskell node would accept it.
+    #[test]
+    fn datum_cbor_is_canonical() {
+        let cbor = sample_datum([7u8; 32]).to_cbor();
+        let hex = hex::encode(&cbor);
+        assert!(
+            hex.starts_with("d8799f"),
+            "non-empty Constr 0 → d879 9f…: {hex}"
+        );
+        assert!(hex.ends_with("ff"), "indefinite array terminator: {hex}");
+    }
+
     #[test]
     fn datum_rejects_bad_shape() {
         // wrong constructor
-        let wrong = constr(1, vec![bytes(&[0u8; 32]), bytes(b""), bytes(b""), bytes(b"")]);
+        let wrong = constr(
+            1,
+            vec![bytes(&[0u8; 32]), bytes(b""), bytes(b""), bytes(b"")],
+        );
         assert!(matches!(
             TreasuryInfoDatum::from_plutus_data(&wrong),
             Err(TreasuryInfoError::WrongConstructor(1))
         ));
         // root not 32 bytes
-        let short = constr(0, vec![bytes(&[0u8; 8]), bytes(b""), bytes(b""), bytes(b"")]);
+        let short = constr(
+            0,
+            vec![bytes(&[0u8; 8]), bytes(b""), bytes(b""), bytes(b"")],
+        );
         assert!(matches!(
             TreasuryInfoDatum::from_plutus_data(&short),
             Err(TreasuryInfoError::BadRootLen(8))
@@ -323,12 +375,18 @@ mod tests {
             new_datum.bifrost_identity_root
         );
         // only the root changed.
-        assert_ne!(new_datum.bifrost_identity_root, current.bifrost_identity_root);
+        assert_ne!(
+            new_datum.bifrost_identity_root,
+            current.bifrost_identity_root
+        );
         assert_eq!(
             new_datum.current_treasury_address,
             current.current_treasury_address
         );
-        assert_eq!(new_datum.current_spos_frost_key, current.current_spos_frost_key);
+        assert_eq!(
+            new_datum.current_spos_frost_key,
+            current.current_spos_frost_key
+        );
     }
 
     #[test]
@@ -356,8 +414,11 @@ mod tests {
         let pd = proof_to_plutus_data(&proof);
 
         match &pd {
-            PlutusData::Array(MaybeIndefArray::Def(steps)) => assert_eq!(steps.len(), proof.len()),
-            other => panic!("expected Array, got {other:?}"),
+            // Canonical: a non-empty list encodes indefinite-length.
+            PlutusData::Array(MaybeIndefArray::Indef(steps)) => {
+                assert_eq!(steps.len(), proof.len());
+            }
+            other => panic!("expected indefinite Array, got {other:?}"),
         }
         // CBOR-encodes and decodes without error.
         let cbor = minicbor::to_vec(&pd).unwrap();

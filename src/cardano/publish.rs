@@ -43,6 +43,28 @@ pub struct WalletUtxo {
     pub pure_ada: bool,
 }
 
+impl WalletUtxo {
+    /// Map a raw Blockfrost UTxO to a coin-selection entry. Deliberately
+    /// lenient on the quantity parse (`unwrap_or(0)`): a zeroed UTxO is simply
+    /// never selected, and an unbalanced tx is rejected by the node anyway.
+    #[must_use]
+    pub fn from_bf(u: &crate::cardano::bf_http::BfUtxo) -> Self {
+        let lovelace: u64 = u
+            .amount
+            .iter()
+            .find(|a| a.unit == "lovelace")
+            .map(|a| a.quantity.parse().unwrap_or(0))
+            .unwrap_or(0);
+        let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
+        WalletUtxo {
+            tx_hash: u.tx_hash.clone(),
+            output_index: u.output_index,
+            lovelace,
+            pure_ada,
+        }
+    }
+}
+
 /// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
 ///
 /// CBOR tags for Plutus constructors 0–6 are 121–127; constructors 7+

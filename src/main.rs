@@ -109,7 +109,8 @@ enum Commands {
         #[arg(long)]
         cardano_mnemonic: Option<String>,
     },
-    /// Print the bootstrap treasury Taproot address.
+    /// Print the bootstrap treasury Taproot address (Bitcoin side; the Cardano
+    /// state UTxO is created by bootstrap-treasury-info).
     BootstrapTreasury {
         /// Path to a TOML configuration file.
         #[arg(long)]
@@ -164,7 +165,8 @@ enum Commands {
     /// of the treasury NFT plus the initial TreasuryDatum (empty MPF identity root,
     /// BTC treasury P2TR scriptPubKey, BTC treasury outpoint, FROST group key).
     /// Spends a wallet UTxO as the one-shot; prints the signed tx, submits only
-    /// with --submit.
+    /// with --submit. (Cardano side; bootstrap-treasury prints the BTC-side
+    /// Taproot address.)
     BootstrapTreasuryInfo {
         #[arg(long)]
         config: Option<String>,
@@ -359,19 +361,10 @@ fn main() {
         }
         Commands::WalletAddress { config } => {
             let cfg = load_config(config.as_deref());
-            let mnemonic = cfg
-                .cardano
-                .mnemonic
-                .clone()
-                .or_else(|| {
-                    std::env::var("HEIMDALL_MNEMONIC")
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                })
-                .unwrap_or_else(|| {
-                    eprintln!("Error: no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)");
-                    std::process::exit(1);
-                });
+            let mnemonic = resolve_mnemonic(&cfg).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            });
             match (
                 heimdall::cardano::wallet::wallet_address_from_mnemonic(&mnemonic),
                 heimdall::cardano::wallet::derive_payment_key(&mnemonic),
@@ -789,19 +782,24 @@ fn run_treasury_self_send(
     Ok(())
 }
 
-/// Scan binocular's on-chain `PegInRequest` UTxOs over N2C, then build, sign and
-/// (optionally) broadcast the Treasury Movement sweeping the current treasury +
-/// all discovered deposits into a new treasury `output[0]`.
-///
-/// The deposits are *discovered* from Cardano (not hand-typed): each PIR is
-/// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
-/// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
-/// so a successful parse is itself proof the spend-info matches the on-chain
-/// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
-/// not required for the pure-Bitcoin sweep).
-#[allow(clippy::too_many_arguments)]
+/// The Cardano wallet mnemonic: `cardano.mnemonic` from config, else
+/// `$HEIMDALL_MNEMONIC`.
+fn resolve_mnemonic(cfg: &HeimdallConfig) -> Result<String, String> {
+    cfg.cardano
+        .mnemonic
+        .clone()
+        .or_else(|| {
+            std::env::var("HEIMDALL_MNEMONIC")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .ok_or_else(|| "no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)".to_string())
+}
+
 /// Parse `<cardano_tx_hash>:<index>` into a 32-byte tx id + output index.
-fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u64), String> {
+/// The index is bounded to `u32` (the ledger's output-index width) so a typo
+/// can never silently wrap into a negative Plutus Int downstream.
+fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u32), String> {
     let (h, i) = s
         .split_once(':')
         .ok_or_else(|| format!("expected <tx_hash>:<index>, got '{s}'"))?;
@@ -809,7 +807,7 @@ fn parse_cardano_outref(s: &str) -> Result<([u8; 32], u64), String> {
         .map_err(|e| format!("tx hash hex: {e}"))?
         .try_into()
         .map_err(|_| "tx hash must be 32 bytes".to_string())?;
-    let index: u64 = i.parse().map_err(|e| format!("output index: {e}"))?;
+    let index: u32 = i.parse().map_err(|e| format!("output index: {e}"))?;
     Ok((tx_id, index))
 }
 
@@ -830,23 +828,14 @@ fn run_bootstrap_treasury_info(
     use heimdall::cardano::treasury_bootstrap::{bootstrap_datum, build_treasury_bootstrap_tx};
     use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
 
-    let mnemonic = cfg
-        .cardano
-        .mnemonic
-        .clone()
-        .or_else(|| {
-            std::env::var("HEIMDALL_MNEMONIC")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .ok_or("no mnemonic (set cardano.mnemonic or $HEIMDALL_MNEMONIC)")?;
+    let mnemonic = resolve_mnemonic(cfg)?;
     let key = derive_payment_key(&mnemonic)?;
     let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
 
     let blueprint_json = std::fs::read_to_string(blueprint_path)
         .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
     let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
-    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, reg_index)
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
         .map_err(|e| format!("parameterize spos_registry: {e}"))?;
     let treasury = treasury_info_script(&blueprint_json, &registry.hash)
         .map_err(|e| format!("parameterize treasury_info: {e}"))?;
@@ -854,12 +843,18 @@ fn run_bootstrap_treasury_info(
     println!("treasury_info policy: {}", treasury.hash_hex());
 
     let spk = hex::decode(btc_treasury_spk).map_err(|e| format!("--btc-treasury-spk: {e}"))?;
+    if spk.len() != 34 || spk[..2] != [0x51, 0x20] {
+        return Err(format!(
+            "--btc-treasury-spk must be a P2TR scriptPubKey (34 bytes, 5120 || x-only key), \
+             got {} bytes",
+            spk.len()
+        ));
+    }
     let outpoint = parse_outpoint(btc_outpoint)?;
     let utxo_id = bitcoin::consensus::encode::serialize(&outpoint);
     let frost = hex::decode(frost_key).map_err(|e| format!("--frost-key: {e}"))?;
-    if frost.len() != 32 {
-        return Err(format!("--frost-key must be 32 bytes, got {}", frost.len()));
-    }
+    bitcoin::XOnlyPublicKey::from_slice(&frost)
+        .map_err(|e| format!("--frost-key is not a valid x-only secp256k1 point: {e}"))?;
     let datum = bootstrap_datum(spk, utxo_id, frost);
 
     let pid = cfg
@@ -873,27 +868,20 @@ fn run_bootstrap_treasury_info(
     let raw = rt
         .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
         .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    // Never let coin selection consume the registry one-shot outref: spending
+    // it would make the spos_registry bootstrap impossible, and treasury.ak's
+    // spend path requires a registry-policy mint — the state UTxO created here
+    // would be frozen at bootstrap forever.
+    let reg_tx_hash_hex = hex::encode(reg_tx_id);
     let wallet_utxos: Vec<WalletUtxo> = raw
         .iter()
-        .map(|u| {
-            let lovelace: u64 = u
-                .amount
-                .iter()
-                .find(|a| a.unit == "lovelace")
-                .map(|a| a.quantity.parse().unwrap_or(0))
-                .unwrap_or(0);
-            let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
-            WalletUtxo {
-                tx_hash: u.tx_hash.clone(),
-                output_index: u.output_index,
-                lovelace,
-                pure_ada,
-            }
-        })
+        .map(WalletUtxo::from_bf)
+        .filter(|u| !(u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index))
         .collect();
     if wallet_utxos.is_empty() {
         return Err(format!(
-            "wallet has no UTxOs — fund it first (address: {wallet_addr})"
+            "wallet has no spendable UTxOs besides the registry bootstrap outref — \
+             fund it first (address: {wallet_addr})"
         ));
     }
     let cost_models = rt
@@ -938,6 +926,17 @@ fn run_bootstrap_treasury_info(
     Ok(())
 }
 
+/// Scan binocular's on-chain `PegInRequest` UTxOs over N2C, then build, sign and
+/// (optionally) broadcast the Treasury Movement sweeping the current treasury +
+/// all discovered deposits into a new treasury `output[0]`.
+///
+/// The deposits are *discovered* from Cardano (not hand-typed): each PIR is
+/// validated by `parse_pegin_request`, which reconstructs the peg-in P2TR from
+/// `(y_fed, depositor_xonly, refund_timeout)` and requires a matching output —
+/// so a successful parse is itself proof the spend-info matches the on-chain
+/// scriptPubKey. The treasury input is passed by arg (its Cardano oracle UTxO is
+/// not required for the pure-Bitcoin sweep).
+#[allow(clippy::too_many_arguments)]
 fn run_sweep_pegins(
     cfg: &HeimdallConfig,
     cardano_socket: &str,
@@ -1585,4 +1584,29 @@ fn run_proof_demo(min_signers: u16, max_signers: u16) {
     );
     println!("  Total wall time:             {total_elapsed:.2?}");
     println!("  Verifiable on Cardano via Plutus V3 BLS12-381 builtins");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cardano_outref;
+
+    #[test]
+    fn parse_cardano_outref_ok() {
+        let (tx_id, index) = parse_cardano_outref(&format!("{}:7", "ab".repeat(32))).unwrap();
+        assert_eq!(tx_id, [0xab; 32]);
+        assert_eq!(index, 7);
+    }
+
+    #[test]
+    fn parse_cardano_outref_rejects_malformed() {
+        // no separator
+        assert!(parse_cardano_outref("aabb").is_err());
+        // hash not 32 bytes
+        assert!(parse_cardano_outref("aabb:0").is_err());
+        // non-hex hash
+        assert!(parse_cardano_outref(&format!("{}:0", "zz".repeat(32))).is_err());
+        // non-numeric / out-of-u32-range index
+        assert!(parse_cardano_outref(&format!("{}:x", "ab".repeat(32))).is_err());
+        assert!(parse_cardano_outref(&format!("{}:4294967296", "ab".repeat(32))).is_err());
+    }
 }

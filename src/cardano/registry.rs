@@ -134,16 +134,27 @@ fn bytes(b: &[u8]) -> PlutusData {
 }
 
 /// A Plutus `Constr` with constructor index `c` (0..=6 → tag 121+c; 7+ → tag 102).
+///
+/// Fields use the CANONICAL plutus-core encoding (indefinite-length array when
+/// non-empty, definite empty otherwise): the linked-list validator compares
+/// continued datums structurally, and the Rust uplc evaluator — unlike a
+/// Haskell node — is encoding-sensitive, so a definite-encoded datum fails
+/// pre-validation/simulation (see `treasury_info::constr`).
 fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
     let (tag, any_constructor) = if c <= 6 {
         (121 + c, None)
     } else {
         (102, Some(c))
     };
+    let fields = if fields.is_empty() {
+        MaybeIndefArray::Def(fields)
+    } else {
+        MaybeIndefArray::Indef(fields)
+    };
     PlutusData::Constr(Constr {
         tag,
         any_constructor,
-        fields: MaybeIndefArray::Def(fields),
+        fields,
     })
 }
 

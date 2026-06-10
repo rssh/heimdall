@@ -52,15 +52,29 @@ fn bytes(b: &[u8]) -> PlutusData {
     PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
 }
 
+/// Plutus `Int`. Callers never exceed `u32` output indexes in practice; values
+/// above `i64::MAX` are rejected rather than silently wrapped.
 fn int(n: u64) -> PlutusData {
-    PlutusData::BigInt(BigInt::Int((n as i64).into()))
+    let n = i64::try_from(n).expect("output index exceeds i64::MAX");
+    PlutusData::BigInt(BigInt::Int(n.into()))
 }
 
-fn constr(c: u64, fields: MaybeIndefArray<PlutusData>) -> PlutusData {
+/// A Plutus `Constr` in the CANONICAL plutus-core encoding: indefinite-length
+/// fields when non-empty, definite empty otherwise. Canonical form is required
+/// twice over: `hash_output_ref` must byte-match the on-chain `serialiseData`,
+/// and the Rust uplc evaluator (whisky / `aiken tx simulate`) compares datums
+/// and re-serialises redeemers ENCODING-SENSITIVELY — a definite-encoded
+/// redeemer/datum fails simulation even though a Haskell node accepts it.
+fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
     let (tag, any_constructor) = if c <= 6 {
         (121 + c, None)
     } else {
         (102, Some(c))
+    };
+    let fields = if fields.is_empty() {
+        MaybeIndefArray::Def(fields)
+    } else {
+        MaybeIndefArray::Indef(fields)
     };
     PlutusData::Constr(Constr {
         tag,
@@ -79,22 +93,17 @@ fn constr(c: u64, fields: MaybeIndefArray<PlutusData>) -> PlutusData {
 /// `serialiseData` builtin exactly (indefinite-length Constr fields).
 #[must_use]
 pub fn hash_output_ref(tx_id: &[u8; 32], output_index: u64) -> [u8; 32] {
-    let output_ref = constr(
-        0,
-        MaybeIndefArray::Indef(vec![bytes(tx_id), int(output_index)]),
-    );
+    let output_ref = output_ref_plutus_data(tx_id, output_index);
     let serialised = minicbor::to_vec(&output_ref).expect("PlutusData CBOR encode");
     sha256::Hash::hash(&serialised).to_byte_array()
 }
 
-/// The redeemer-side `OutputReference` (wire encoding need not match
-/// `serialiseData` — the validator re-serialises the decoded value).
+/// The `OutputReference` as Plutus data, canonically encoded — shared by the
+/// asset-name hash and the redeemer, so the name the policy recomputes from
+/// the redeemer is the name we mint by construction.
 #[must_use]
 pub fn output_ref_plutus_data(tx_id: &[u8; 32], output_index: u64) -> PlutusData {
-    constr(
-        0,
-        MaybeIndefArray::Def(vec![bytes(tx_id), int(output_index)]),
-    )
+    constr(0, vec![bytes(tx_id), int(output_index)])
 }
 
 // ---------------------------------------------------------------------------
@@ -128,12 +137,12 @@ pub fn treasury_mint_redeemer(
 ) -> PlutusData {
     constr(
         0,
-        MaybeIndefArray::Def(vec![
+        vec![
             output_ref_plutus_data(tx_id, output_index),
             bytes(&datum.current_treasury_address),
             bytes(&datum.current_treasury_utxo_id),
             bytes(&datum.current_spos_frost_key),
-        ]),
+        ],
     )
 }
 
@@ -223,6 +232,17 @@ pub fn build_treasury_bootstrap_tx(
     // stay with the conservative datum-scaled formula from publish.rs.
     let datum_bytes = (datum_hex.len() / 2) as u64;
     let state_lovelace = std::cmp::max(2_000_000u64, (datum_bytes + 600) * 4310);
+
+    // Single-input coin selection: fail with an actionable message instead of
+    // an opaque whisky balancing error when the richest UTxO can't cover the
+    // state output plus a fee margin.
+    if fee_utxo.lovelace < state_lovelace + 1_000_000 {
+        return Err(EpochError::Chain(format!(
+            "largest wallet UTxO ({} lovelace) cannot cover the {state_lovelace}-lovelace \
+             state output plus fees — fund the wallet or consolidate UTxOs",
+            fee_utxo.lovelace
+        )));
+    }
 
     let body = TxBuilderBody {
         inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
@@ -367,11 +387,30 @@ mod tests {
     // the hash, so a pallas encoding change fails loudly here.
     #[test]
     fn output_ref_serialise_data_is_indefinite() {
-        let output_ref = constr(0, MaybeIndefArray::Indef(vec![bytes(&[0xaa; 32]), int(1)]));
+        let output_ref = output_ref_plutus_data(&[0xaa; 32], 1);
         let cbor = minicbor::to_vec(&output_ref).unwrap();
         assert_eq!(
             hex::encode(cbor),
             format!("d8799f5820{}01ff", "aa".repeat(32))
+        );
+    }
+
+    // The whole redeemer must also be canonically encoded: the Rust uplc
+    // evaluator re-serialises `redeemer.input_ref` with encoding memory, so a
+    // definite-encoded redeemer makes the asset-name check fail in simulation
+    // (a Haskell node would accept it — but tooling parity matters).
+    #[test]
+    fn mint_redeemer_is_canonical() {
+        let d = bootstrap_datum(vec![1, 2], vec![3, 4], vec![5, 6]);
+        let r = treasury_mint_redeemer(&[0xaa; 32], 1, &d);
+        let hex = hex::encode(minicbor::to_vec(&r).unwrap());
+        // Constr 0 indef [ Constr 0 indef [ bytes32, 1 ], 0102, 0304, 0506 ]
+        assert_eq!(
+            hex,
+            format!(
+                "d8799fd8799f5820{}01ff420102420304420506ff",
+                "aa".repeat(32)
+            )
         );
     }
 
@@ -404,6 +443,28 @@ mod tests {
         assert_eq!(input_ref.tag, 121);
         assert_eq!(input_ref.fields.len(), 2);
         assert!(matches!(&c.fields[1], PlutusData::BoundedBytes(b) if **b == [1u8, 2]));
+    }
+
+    // The builder refuses a datum whose root is not the empty-MPF root — the
+    // validator pins mpf.root(mpf.empty), so anything else burns fees on a
+    // guaranteed phase-2 failure.
+    #[test]
+    fn build_rejects_non_empty_root() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let key = derive_payment_key(mnemonic).unwrap();
+        let wallet_addr = crate::cardano::wallet::wallet_address(&key);
+        let mut datum = bootstrap_datum(vec![1], vec![2], vec![3]);
+        datum.bifrost_identity_root = [9u8; 32];
+        let utxos = vec![WalletUtxo {
+            tx_hash: "aa".repeat(32),
+            output_index: 0,
+            lovelace: 50_000_000,
+            pure_ada: true,
+        }];
+        let err =
+            build_treasury_bootstrap_tx(&test_script(), &wallet_addr, &utxos, &datum, &key, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("empty MPF root"), "{err}");
     }
 
     fn test_script() -> blueprint::ParameterizedScript {
@@ -495,6 +556,37 @@ mod tests {
             TreasuryInfoDatum::from_plutus_data(&wrapped.0).unwrap(),
             datum
         );
+
+        // The script output's value is lovelace + exactly the one NFT — the
+        // validator requires flatten(without_lovelace(value)) == [(policy,
+        // name, 1)], so any stray asset is a phase-2 failure.
+        let pallas_primitives::conway::Value::Multiasset(_, ma) = &out.value else {
+            panic!("expected multiasset value on the state output");
+        };
+        let out_policies: Vec<_> = ma.iter().collect();
+        assert_eq!(out_policies.len(), 1);
+        assert_eq!(out_policies[0].0.as_slice(), script.hash);
+        let out_assets: Vec<_> = out_policies[0].1.iter().collect();
+        assert_eq!(out_assets.len(), 1);
+        assert_eq!(out_assets[0].0.as_slice(), expected_name);
+        assert_eq!(u64::from(out_assets[0].1), 1);
+
+        // Witness set: the mint redeemer rides along, canonically encoded.
+        let redeemers = tx
+            .transaction_witness_set
+            .redeemer
+            .as_ref()
+            .expect("redeemer present");
+        let expected_redeemer = treasury_mint_redeemer(&[0xbb; 32], 3, &datum);
+        let redeemer_matches = match redeemers {
+            pallas_primitives::conway::Redeemers::List(rs) => {
+                rs.iter().any(|r| r.data == expected_redeemer)
+            }
+            pallas_primitives::conway::Redeemers::Map(kv) => {
+                kv.iter().any(|(_, v)| v.data == expected_redeemer)
+            }
+        };
+        assert!(redeemer_matches, "mint redeemer not found in witness set");
 
         // Signed: a vkey witness for our key.
         let pk: [u8; 32] = key.public_key().into();

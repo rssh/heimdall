@@ -105,12 +105,14 @@ pub fn validator_compiled_code(
     let validators = bp["validators"]
         .as_array()
         .ok_or_else(|| BlueprintError::BadBlueprint("no validators array".into()))?;
-    validators
+    let validator = validators
         .iter()
         .find(|v| v["title"].as_str() == Some(title))
-        .and_then(|v| v["compiledCode"].as_str())
+        .ok_or_else(|| BlueprintError::ValidatorNotFound(title.into()))?;
+    validator["compiledCode"]
+        .as_str()
         .map(str::to_owned)
-        .ok_or_else(|| BlueprintError::ValidatorNotFound(title.into()))
+        .ok_or_else(|| BlueprintError::BadBlueprint(format!("{title}: no compiledCode")))
 }
 
 /// Plutus V3 script hash: `blake2b_224(0x03 || script_cbor)`.
@@ -130,6 +132,13 @@ pub fn apply_params(
 ) -> Result<ParameterizedScript, BlueprintError> {
     let script =
         hex::decode(compiled_code_hex).map_err(|e| BlueprintError::BadHex(e.to_string()))?;
+    // uplc's apply_params_to_script unwrap()s the params decode and panics on a
+    // non-Array — unreachable from here because we encode the Array ourselves
+    // (keep it that way). Garbage `compiled_code_hex` returns Err cleanly;
+    // pathologically nested code can still abort via unbounded recursion in
+    // uplc's flat decoder, acceptable for an operator-supplied local file.
+    // NB: any future Constr-typed param must be canonically encoded
+    // (indefinite-length fields) — the encoding is embedded into the script.
     let params_array = PlutusData::Array(MaybeIndefArray::Def(params.to_vec()));
     let params_cbor =
         minicbor::to_vec(&params_array).map_err(|e| BlueprintError::Uplc(e.to_string()))?;
@@ -146,8 +155,12 @@ fn param_bytes(b: &[u8]) -> PlutusData {
     PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
 }
 
+/// Plutus `Int` param. Output indexes never approach `i64::MAX`; reject rather
+/// than silently wrap to a negative Int (which would derive a wrong-but-
+/// plausible policy id).
 fn param_int(n: u64) -> PlutusData {
-    PlutusData::BigInt(BigInt::Int((n as i64).into()))
+    let n = i64::try_from(n).expect("integer param exceeds i64::MAX");
+    PlutusData::BigInt(BigInt::Int(n.into()))
 }
 
 /// `spos_registry` parameterized by its one-shot bootstrap output ref
@@ -237,15 +250,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn enterprise_address_mainnet_prefix() {
+        let applied = apply_params(
+            TREASURY_INFO_CODE.trim(),
+            &[param_bytes(&REGISTRY_POLICY_FOR_VECTOR)],
+        )
+        .unwrap();
+        let addr = applied.enterprise_address(Network::Mainnet);
+        assert!(addr.starts_with("addr1w"), "mainnet script address: {addr}");
+    }
+
+    // Valid hex that is not a CBOR-wrapped UPLC program must come back as a
+    // clean Err — never a panic (the uplc unwrap()s live on the params side,
+    // which we encode ourselves).
+    #[test]
+    fn apply_params_rejects_garbage_code() {
+        let err = apply_params("deadbeef", &[param_int(1)]).unwrap_err();
+        assert!(matches!(err, BlueprintError::Uplc(_)), "{err}");
+    }
+
     // Full chain against the real upstream blueprint — needs the FluidTokens
-    // checkout, so it is gated on $BIFROST_PLUTUS_JSON and skipped otherwise.
+    // checkout. Run with:
+    //   BIFROST_PLUTUS_JSON=.../onchain/plutus.json cargo test -- --ignored
     // Expected hashes generated with `aiken blueprint apply` (aiken v1.1.21).
     #[test]
+    #[ignore = "needs $BIFROST_PLUTUS_JSON (ft-bifrost-bridge checkout)"]
     fn registry_then_treasury_chain_matches_aiken() {
-        let Ok(path) = std::env::var("BIFROST_PLUTUS_JSON") else {
-            eprintln!("BIFROST_PLUTUS_JSON not set — skipping blueprint chain test");
-            return;
-        };
+        let path = std::env::var("BIFROST_PLUTUS_JSON")
+            .expect("set BIFROST_PLUTUS_JSON to the upstream plutus.json");
         let blueprint = std::fs::read_to_string(path).unwrap();
         let registry = spos_registry_script(&blueprint, &[0xaa; 32], 1).unwrap();
         assert_eq!(
