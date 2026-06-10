@@ -21,6 +21,7 @@ pub mod pegin_datum;
 pub mod pegin_source;
 pub mod publish;
 pub mod treasury_datum;
+pub mod treasury_info;
 pub mod wallet;
 
 pub use pegin_source::{CardanoOutRef, CardanoPegInRequest, CardanoPegInSource};
