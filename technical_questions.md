@@ -102,3 +102,68 @@ add `fee_rate_sat_per_vb` (and the per-peg-out fee) to `ConfigDatum` so SPOs
 read consensus values, or specify another agreed source? Tracked as a heimdall
 work item (source TM fee params from the on-chain Config UTxO) that gates real
 multi-SPO TM signing.
+
+### 2c. The Config UTxO is undocumented in the spec, and immutable in code
+
+The `config.ak` Config UTxO is the central protocol-parameter oracle in the
+implementation — `peg_in.ak` / `peg_out.ak` are parameterized by
+`config_nft_policy_id` + `config_nft_asset_name` and read `ConfigDatum` as a
+reference input at runtime (verifier script hashes, token policies, `min_stake`).
+Yet in the spec:
+
+- `config.ak` / the Config UTxO is **absent from the on-chain components list**
+  (which enumerates `spos_registry`, `spo_bans`, `fault_verifier`, `peg_in`,
+  `peg_out`, `treasury`, `treasury_movement`, `bridged_asset`). The Config UTxO
+  is mentioned exactly **once** in the whole document (the `fee_rate_sat_per_vb`
+  line above), with no datum/field/governance description.
+- That single mention is wrong on two counts vs the code: (i) `ConfigDatum`
+  has no fee field (see 2b); (ii) it says "updated by governance," but
+  `config.ak`'s `spend` branch is `False` — the Config UTxO is **immutable**
+  once minted and can never be updated by anyone.
+
+So "read the fee from the governance-updated Config UTxO" is **not
+implementable against the current contracts**: the field isn't there and the
+UTxO can't be updated.
+
+### Resolution direction (decided 2026-06-11): fix CONTRACTS to the spec
+
+Unlike §1 (registration linked-list, where the code is the newer deliberate
+artifact and the **spec** is canonical — resolve spec-ward), §2 resolves
+**code-ward: the spec's design (a governance-updatable Config UTxO holding the
+fee parameters) is canonical, and the contracts are to be brought into
+compliance.** Each `spec_differences` entry names its own canonical side so the
+two are not later "fixed" in the wrong direction.
+
+These are FluidTokens **upstream** contracts (`ft-bifrost-bridge`); heimdall
+cannot change them unilaterally, so a-d below are a change request to / upstream
+contribution for FluidTokens, and the spec itself must be elaborated in tandem
+(it is currently incomplete and self-contradictory, per 2a-2c). Concrete work
+this decision implies:
+
+- **(a) Spec** — document the Config UTxO + `ConfigDatum` field list; add
+  `fee_rate_sat_per_vb` + the per-peg-out fee; define the governance update
+  mechanism; resolve gross-vs-net (2a); state the per-peg-out fee value and
+  whether fees are exact or leader-bounded (see the signing-model note below).
+- **(b) Contract** — add the fee fields to `ConfigDatum`
+  (`lib/bifrost/types/config.ak`).
+- **(c) Contract** — change `config.ak` `spend` from `False` to a
+  governance-authorized update path so the Config UTxO is actually updatable.
+- **(d) Contract** — implement the
+  `legit_treasury_movement_and_peg_out_produced` verifier (today unimplemented)
+  to check the BTC output value == gross − fee. This is also the missing piece
+  that makes the whole peg-out completion path currently unverifiable.
+- **(e) heimdall** — read the fee params from the Config UTxO reference input;
+  drop local `bitcoin.*fee*` as the source of truth (keep only as a dev
+  override). This is WI-009, gated on (a)-(d).
+
+Dependency: (a) → (b,c,d) → (e).
+
+**Signing-model sub-question (open).** Whether the fee must be an *exact*
+consensus value or a governance-set *bound* depends on the FROST signing model:
+(A) every SPO independently reconstructs the identical tx (exact value
+required), vs (B) a leader proposes the tx and each signer validates-then-signs
+(a bound suffices, and signers must NEVER blind-sign — they validate inputs,
+peg-out destinations/amounts at gross − fee, treasury next-address, and that
+the fee is within bounds). (B) handles real-time Bitcoin fee movement better. A
+governance-updatable Config UTxO (c) supports either. To be decided with the
+spec elaboration (a).
