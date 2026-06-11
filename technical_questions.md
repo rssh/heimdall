@@ -54,6 +54,14 @@ NFT asset name, `Element{data, link}` datum), or is a datum-key redesign
 intended? Until answered, the spec/code mismatch is tracked as a heimdall
 work item blocking register_spo tx construction (WI-005).
 
+**Resolved (2026-06-11): spec-ward.** The code is canonical; the spec was
+patched to match. `technical_documentation.md` §3.2 (registration) and §3.4
+(ban — same `linked_list.Element` shape, same error) now describe the key as
+the NFT asset name and the datum as `Element{data, link}`, with the operation
+names (`linked_list.insert_ascending`/`remove`) and module reference
+corrected. ft-bifrost-bridge commit `4bcc70e` (fork
+`feat/b1-confirm-tm-reference`). WI-008 closed; WI-005 unblocked.
+
 ## 2. Peg-out amount: gross vs net, and where the TM fee parameters live
 
 Two related issues found while wiring the Treasury Movement peg-out payments
