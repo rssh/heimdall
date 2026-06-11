@@ -409,6 +409,12 @@ pub struct RegisterSpoRequest<'a> {
     /// into a different epoch's candidate snapshot than intended.
     pub invalid_before: Option<u64>,
     pub invalid_hereafter: Option<u64>,
+    /// `(tx_hash, index)` of a UTxO carrying the registry script as a
+    /// reference script (see [`build_ref_script_deploy_tx`]). REQUIRED on a
+    /// real network: the ~12 KB registry script is needed by BOTH the anchor
+    /// spend and the mint, and embedding it twice blows past the 16 KB
+    /// tx-size limit. `None` embeds it (offline tests).
+    pub registry_ref: Option<(String, u32)>,
     /// Live `[V1, V2, V3]` cost models; `None` → whisky's built-in Preprod.
     pub cost_models: Option<Vec<Vec<i64>>>,
 }
@@ -441,15 +447,18 @@ fn tx_id_bytes(tx_hash: &str) -> Result<[u8; 32], RegisterSpoError> {
         .ok_or_else(|| RegisterSpoError::Build(format!("bad tx hash: {tx_hash}")))
 }
 
-/// Pick the fee input (richest wallet UTxO) and a pure-ADA collateral.
+/// Pick the fee input (richest clean wallet UTxO) and a pure-ADA collateral.
+/// Both picks skip token-bearing and reference-script UTxOs (`pure_ada`) — a
+/// ref-script spend incurs the Conway per-byte fee the builder doesn't price.
 fn select_fee_and_collateral(
     wallet_utxos: &[WalletUtxo],
     min_fee_lovelace: u64,
 ) -> Result<(&WalletUtxo, &WalletUtxo), RegisterSpoError> {
     let fee_utxo = wallet_utxos
         .iter()
+        .filter(|u| u.pure_ada)
         .max_by_key(|u| u.lovelace)
-        .ok_or_else(|| RegisterSpoError::Wallet("no wallet UTxOs for fees".into()))?;
+        .ok_or_else(|| RegisterSpoError::Wallet("no clean wallet UTxOs for fees".into()))?;
     if fee_utxo.lovelace < min_fee_lovelace {
         return Err(RegisterSpoError::Wallet(format!(
             "largest wallet UTxO ({} lovelace) cannot cover the new outputs plus fees \
@@ -569,6 +578,25 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     // [2] continued treasury (whisky appends the change output after).
     let (anchor_output_index, treasury_output_index) = (0i64, 2i64);
 
+    // The registry script witness: referenced when a ref-script UTxO is given
+    // (the ~12 KB script would not fit twice in one tx), embedded otherwise.
+    let registry_source = match &req.registry_ref {
+        Some((tx_hash, index)) => ScriptSource::InlineScriptSource(InlineScriptSource {
+            ref_tx_in: RefTxIn {
+                tx_hash: tx_hash.clone(),
+                tx_index: *index,
+                script_size: Some(req.registry_script.cbor.len()),
+            },
+            script_hash: registry_policy_hex.clone(),
+            language_version: LanguageVersion::V3,
+            script_size: req.registry_script.cbor.len(),
+        }),
+        None => ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
+            script_cbor: req.registry_script.cbor_hex(),
+            language_version: LanguageVersion::V3,
+        }),
+    };
+
     let anchor_unit = format!("{registry_policy_hex}{}", hex::encode(&plan.anchor_asset_name));
     let anchor_value = vec![
         Asset::new_from_str("lovelace", &anchor.lovelace.to_string()),
@@ -585,10 +613,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
             address: Some(registry_address.clone()),
         },
         script_tx_in: ScriptTxInParameter {
-            script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: req.registry_script.cbor_hex(),
-                language_version: LanguageVersion::V3,
-            })),
+            script_source: Some(registry_source.clone()),
             datum_source: Some(DatumSource::InlineDatumSource(InlineDatumSource {
                 tx_hash: anchor.tx_hash.clone(),
                 tx_index: anchor.output_index,
@@ -687,10 +712,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
                     steps: 3_000_000_000,
                 },
             }),
-            script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: req.registry_script.cbor_hex(),
-                language_version: LanguageVersion::V3,
-            })),
+            script_source: Some(registry_source.clone()),
         })],
         certificates: vec![],
         votes: vec![],
@@ -711,28 +733,47 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
         .serialize_tx_body()
         .map_err(|e| RegisterSpoError::Build(format!("whisky tx build: {e:?}")))?;
 
-    // Defensive: the redeemer indices were derived from the expected input
-    // sort; require the built tx to agree before signing.
-    {
+    // Post-build pass before signing: (a) whisky pushes one reference input
+    // per InlineScriptSource use — dedupe them (duplicate set elements would
+    // be rejected; ref inputs sit outside the script-integrity hash, so the
+    // edit is safe pre-signature); (b) defensive check that the redeemer
+    // indices derived from the expected input sort match the built tx.
+    let unsigned_hex = {
         let tx_bytes = hex::decode(&unsigned_hex)
             .map_err(|e| RegisterSpoError::Build(format!("unsigned tx hex decode: {e}")))?;
-        let tx: Tx = minicbor::decode(&tx_bytes)
+        let mut tx: Tx = minicbor::decode(&tx_bytes)
             .map_err(|e| RegisterSpoError::Build(format!("tx minicbor decode: {e}")))?;
-        let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
-        let at = |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), RegisterSpoError> {
-            let got = inputs.get(i as usize).ok_or_else(|| {
-                RegisterSpoError::Build(format!("{what} input index {i} out of range"))
-            })?;
-            if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
-                return Err(RegisterSpoError::Build(format!(
-                    "{what} input not at redeemer index {i} — input ordering changed"
-                )));
-            }
-            Ok(())
-        };
-        at(anchor_input_index, &anchor_ref, "anchor")?;
-        at(treasury_input_index, &treasury_ref, "treasury")?;
-    }
+
+        if let Some(ref_ins) = tx.transaction_body.reference_inputs.take() {
+            let mut v = ref_ins.to_vec();
+            v.sort_by_key(|i| (i.transaction_id, i.index));
+            v.dedup();
+            tx.transaction_body.reference_inputs = pallas_codec::utils::NonEmptySet::from_vec(v);
+        }
+
+        {
+            let inputs: Vec<_> = tx.transaction_body.inputs.iter().collect();
+            let at =
+                |i: i64, want: &([u8; 32], u32), what: &str| -> Result<(), RegisterSpoError> {
+                    let got = inputs.get(i as usize).ok_or_else(|| {
+                        RegisterSpoError::Build(format!("{what} input index {i} out of range"))
+                    })?;
+                    if got.transaction_id.as_slice() != want.0 || got.index != u64::from(want.1) {
+                        return Err(RegisterSpoError::Build(format!(
+                            "{what} input not at redeemer index {i} — input ordering changed"
+                        )));
+                    }
+                    Ok(())
+                };
+            at(anchor_input_index, &anchor_ref, "anchor")?;
+            at(treasury_input_index, &treasury_ref, "treasury")?;
+        }
+
+        hex::encode(
+            minicbor::to_vec(&tx)
+                .map_err(|e| RegisterSpoError::Build(format!("tx re-encode: {e}")))?,
+        )
+    };
 
     let signed_tx_hex = sign_built_tx(&unsigned_hex, req.key)?;
     Ok(RegisterSpoTx {
@@ -757,10 +798,38 @@ pub struct RegistryBootstrapTx {
     pub script_address: String,
 }
 
+/// Conway `minFeeRefScriptCostPerByte` (preprod + mainnet). Charged on
+/// reference scripts attached to SPENT inputs — which whisky's fee estimation
+/// does not model; the builder adds it explicitly when the one-shot is forced
+/// to be a ref-script UTxO.
+const REF_SCRIPT_FEE_PER_BYTE: u64 = 15;
+
+/// The Conway tiered ref-script fee (×1.2 per started 25600-byte tier).
+fn ref_script_fee(script_size: u64) -> u64 {
+    const TIER: u64 = 25_600;
+    let mut fee = 0f64;
+    let mut multiplier = 1f64;
+    let mut remaining = script_size;
+    while remaining >= TIER {
+        fee += TIER as f64 * multiplier * REF_SCRIPT_FEE_PER_BYTE as f64;
+        remaining -= TIER;
+        multiplier *= 1.2;
+    }
+    fee += remaining as f64 * multiplier * REF_SCRIPT_FEE_PER_BYTE as f64;
+    fee.ceil() as u64
+}
+
 /// Build + sign the registry-list bootstrap: spend the one-shot outref that
 /// parameterizes `spos_registry` (it MUST be among `wallet_utxos`) and mint
 /// the `"reg-root"` anchor NFT to the registry script address with the
 /// `Element{Root, link: None}` inline datum.
+///
+/// `one_shot_ref_script_size`: byte size of a reference script attached to the
+/// one-shot UTxO, if any. The outref was fixed when the policy was
+/// parameterized, so unlike ordinary coin selection it cannot be swapped for a
+/// clean UTxO — instead the ledger's per-byte ref-script fee is added on top
+/// of whisky's estimate (second build pass with an explicit fee).
+#[allow(clippy::too_many_arguments)]
 pub fn build_registry_bootstrap_tx(
     registry_script: &ParameterizedScript,
     bootstrap_tx_hash: &str,
@@ -768,6 +837,7 @@ pub fn build_registry_bootstrap_tx(
     wallet_address: &str,
     wallet_utxos: &[WalletUtxo],
     key: &PrivateKey,
+    one_shot_ref_script_size: Option<u64>,
     cost_models: Option<Vec<Vec<i64>>>,
 ) -> Result<RegistryBootstrapTx, RegisterSpoError> {
     let one_shot = wallet_utxos
@@ -825,43 +895,168 @@ pub fn build_registry_bootstrap_tx(
     let redeemer_hex =
         hex::encode(minicbor::to_vec(bootstrap_mint_redeemer()).expect("redeemer CBOR encode"));
 
-    let body = TxBuilderBody {
-        inputs: inputs
-            .iter()
-            .map(|u| {
-                TxIn::PubKeyTxIn(PubKeyTxIn {
-                    tx_in: TxInParameter {
-                        tx_hash: u.tx_hash.clone(),
-                        tx_index: u.output_index,
-                        amount: Some(vec![Asset::new_from_str(
-                            "lovelace",
-                            &u.lovelace.to_string(),
-                        )]),
-                        address: Some(wallet_address.to_string()),
-                    },
+    let build = |fee: Option<String>| -> Result<String, RegisterSpoError> {
+        let body = TxBuilderBody {
+            inputs: inputs
+                .iter()
+                .map(|u| {
+                    TxIn::PubKeyTxIn(PubKeyTxIn {
+                        tx_in: TxInParameter {
+                            tx_hash: u.tx_hash.clone(),
+                            tx_index: u.output_index,
+                            amount: Some(vec![Asset::new_from_str(
+                                "lovelace",
+                                &u.lovelace.to_string(),
+                            )]),
+                            address: Some(wallet_address.to_string()),
+                        },
+                    })
                 })
-            })
-            .collect(),
-        outputs: vec![Output {
-            address: script_address.clone(),
-            amount: vec![
-                Asset::new_from_str("lovelace", &root_lovelace.to_string()),
-                Asset::new_from_str(&root_unit, "1"),
-            ],
-            datum: Some(Datum::Inline(hex::encode(root_datum_cbor))),
-            reference_script: None,
-        }],
-        collaterals: vec![PubKeyTxIn {
+                .collect(),
+            outputs: vec![Output {
+                address: script_address.clone(),
+                amount: vec![
+                    Asset::new_from_str("lovelace", &root_lovelace.to_string()),
+                    Asset::new_from_str(&root_unit, "1"),
+                ],
+                datum: Some(Datum::Inline(hex::encode(root_datum_cbor.clone()))),
+                reference_script: None,
+            }],
+            collaterals: vec![PubKeyTxIn {
+                tx_in: TxInParameter {
+                    tx_hash: coll_utxo.tx_hash.clone(),
+                    tx_index: coll_utxo.output_index,
+                    amount: Some(vec![Asset::new_from_str(
+                        "lovelace",
+                        &coll_utxo.lovelace.to_string(),
+                    )]),
+                    address: Some(wallet_address.to_string()),
+                },
+            }],
+            required_signatures: vec![pub_key_hash_hex(key)],
+            change_address: wallet_address.to_string(),
+            signing_key: vec![],
+            network: Some(match &cost_models {
+                Some(cm) => whisky::Network::Custom(cm.clone()),
+                None => whisky::Network::Preprod,
+            }),
+            reference_inputs: vec![],
+            withdrawals: vec![],
+            mints: vec![MintItem::ScriptMint(ScriptMint {
+                mint: MintParameter {
+                    policy_id: policy_id_hex.clone(),
+                    asset_name: hex::encode(REGISTRATION_ROOT_KEY),
+                    amount: 1,
+                },
+                redeemer: Some(Redeemer {
+                    data: redeemer_hex.clone(),
+                    // Bootstrap checks the one-shot is spent + the root output
+                    // shape — light.
+                    ex_units: Budget {
+                        mem: 2_000_000,
+                        steps: 900_000_000,
+                    },
+                }),
+                script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
+                    script_cbor: registry_script.cbor_hex(),
+                    language_version: LanguageVersion::V3,
+                })),
+            })],
+            certificates: vec![],
+            votes: vec![],
+            fee,
+            change_datum: None,
+            metadata: vec![],
+            validity_range: ValidityRange {
+                invalid_before: None,
+                invalid_hereafter: None,
+            },
+            total_collateral: None,
+            collateral_return_address: None,
+        };
+        let mut pallas = WhiskyPallas::new(None);
+        pallas.tx_builder_body = body;
+        pallas
+            .serialize_tx_body()
+            .map_err(|e| RegisterSpoError::Build(format!("whisky tx build: {e:?}")))
+    };
+
+    // Pass 1: whisky's own fee estimate. When the one-shot carries a reference
+    // script, rebuild with that fee plus the ledger's ref-script charge (and a
+    // small margin for the changed fee bytes).
+    let mut unsigned_hex = build(None)?;
+    if let Some(script_size) = one_shot_ref_script_size {
+        let tx_bytes = hex::decode(&unsigned_hex)
+            .map_err(|e| RegisterSpoError::Build(format!("unsigned tx hex decode: {e}")))?;
+        let tx: Tx = minicbor::decode(&tx_bytes)
+            .map_err(|e| RegisterSpoError::Build(format!("tx minicbor decode: {e}")))?;
+        let auto_fee = tx.transaction_body.fee;
+        let fee = auto_fee + ref_script_fee(script_size) + 4_400;
+        unsigned_hex = build(Some(fee.to_string()))?;
+    }
+    let signed_tx_hex = sign_built_tx(&unsigned_hex, key)?;
+
+    Ok(RegistryBootstrapTx {
+        signed_tx_hex,
+        policy_id_hex,
+        script_address,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Reference-script deployment
+// ---------------------------------------------------------------------------
+
+/// A built (signed, unsubmitted) reference-script deploy tx. The script lands
+/// at output #0 of this tx, key-locked at the wallet address (reclaimable).
+#[derive(Debug, Clone)]
+pub struct RefScriptDeployTx {
+    pub signed_tx_hex: String,
+    pub script_hash_hex: String,
+    /// Lovelace locked with the reference script (min-UTxO scales with size).
+    pub lovelace: u64,
+}
+
+/// Deploy `script` as a reference script: a plain payment tx whose output #0
+/// (at the wallet's own address) carries the script in its `reference_script`
+/// field. register_spo then references it instead of embedding the ~12 KB
+/// script twice — which would not fit in the 16 KB tx-size limit.
+pub fn build_ref_script_deploy_tx(
+    script: &ParameterizedScript,
+    wallet_address: &str,
+    wallet_utxos: &[WalletUtxo],
+    key: &PrivateKey,
+    cost_models: Option<Vec<Vec<i64>>>,
+) -> Result<RefScriptDeployTx, RegisterSpoError> {
+    // Min-UTxO scales with the serialized output, dominated by the script.
+    let ref_lovelace = (script.cbor.len() as u64 + 600) * 4310;
+    let (fee_utxo, _) = select_fee_and_collateral(wallet_utxos, ref_lovelace + 1_000_000)?;
+
+    let body = TxBuilderBody {
+        inputs: vec![TxIn::PubKeyTxIn(PubKeyTxIn {
             tx_in: TxInParameter {
-                tx_hash: coll_utxo.tx_hash.clone(),
-                tx_index: coll_utxo.output_index,
+                tx_hash: fee_utxo.tx_hash.clone(),
+                tx_index: fee_utxo.output_index,
                 amount: Some(vec![Asset::new_from_str(
                     "lovelace",
-                    &coll_utxo.lovelace.to_string(),
+                    &fee_utxo.lovelace.to_string(),
                 )]),
                 address: Some(wallet_address.to_string()),
             },
+        })],
+        outputs: vec![Output {
+            address: wallet_address.to_string(),
+            amount: vec![Asset::new_from_str("lovelace", &ref_lovelace.to_string())],
+            datum: None,
+            reference_script: Some(OutputScriptSource::ProvidedScriptSource(
+                ProvidedScriptSource {
+                    script_cbor: script.cbor_hex(),
+                    language_version: LanguageVersion::V3,
+                },
+            )),
         }],
+        // No scripts execute in this tx — no collateral needed.
+        collaterals: vec![],
         required_signatures: vec![pub_key_hash_hex(key)],
         change_address: wallet_address.to_string(),
         signing_key: vec![],
@@ -871,26 +1066,7 @@ pub fn build_registry_bootstrap_tx(
         }),
         reference_inputs: vec![],
         withdrawals: vec![],
-        mints: vec![MintItem::ScriptMint(ScriptMint {
-            mint: MintParameter {
-                policy_id: policy_id_hex.clone(),
-                asset_name: hex::encode(REGISTRATION_ROOT_KEY),
-                amount: 1,
-            },
-            redeemer: Some(Redeemer {
-                data: redeemer_hex,
-                // Bootstrap checks the one-shot is spent + the root output
-                // shape — light.
-                ex_units: Budget {
-                    mem: 2_000_000,
-                    steps: 900_000_000,
-                },
-            }),
-            script_source: Some(ScriptSource::ProvidedScriptSource(ProvidedScriptSource {
-                script_cbor: registry_script.cbor_hex(),
-                language_version: LanguageVersion::V3,
-            })),
-        })],
+        mints: vec![],
         certificates: vec![],
         votes: vec![],
         fee: None,
@@ -911,10 +1087,10 @@ pub fn build_registry_bootstrap_tx(
         .map_err(|e| RegisterSpoError::Build(format!("whisky tx build: {e:?}")))?;
     let signed_tx_hex = sign_built_tx(&unsigned_hex, key)?;
 
-    Ok(RegistryBootstrapTx {
+    Ok(RefScriptDeployTx {
         signed_tx_hex,
-        policy_id_hex,
-        script_address,
+        script_hash_hex: script.hash_hex(),
+        lovelace: ref_lovelace,
     })
 }
 
@@ -1100,6 +1276,7 @@ mod tests {
                 },
             ],
             inline_datum: Some(hex::encode(element.to_cbor())),
+            reference_script_hash: None,
         }
     }
 
@@ -1133,6 +1310,7 @@ mod tests {
                 quantity: "1000000".into(),
             }],
             inline_datum: None,
+            reference_script_hash: None,
         };
         let got = find_registry_utxos(&[stray, root.clone()], &policy).unwrap();
         assert_eq!(got.len(), 1);
@@ -1197,6 +1375,7 @@ mod tests {
                 },
             ],
             inline_datum: Some(hex::encode(treasury_datum.to_cbor())),
+            reference_script_hash: None,
         }];
 
         let key = derive_payment_key(TEST_MNEMONIC).unwrap();
@@ -1223,6 +1402,7 @@ mod tests {
             bifrost_url: URL.to_vec(),
             invalid_before: Some(70_000_000),
             invalid_hereafter: Some(70_432_000),
+            registry_ref: None,
             cost_models: None,
         };
         let built = build_register_spo_tx(&req).expect("build register_spo tx");
@@ -1492,6 +1672,7 @@ mod tests {
             bifrost_url: URL.to_vec(),
             invalid_before: None,
             invalid_hereafter: None,
+            registry_ref: None,
             cost_models: None,
         };
         assert!(matches!(
@@ -1528,6 +1709,7 @@ mod tests {
                 },
             ],
             inline_datum: Some(hex::encode(bad_datum.to_cbor())),
+            reference_script_hash: None,
         }];
         let req = RegisterSpoRequest {
             registry_utxos: &elements,
@@ -1579,6 +1761,7 @@ mod tests {
             &wallet_addr,
             &utxos,
             &key,
+            None,
             None,
         )
         .unwrap();
@@ -1634,6 +1817,7 @@ mod tests {
             &wallet_addr,
             &utxos,
             &key,
+            None,
             None,
         )
         .unwrap_err();

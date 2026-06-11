@@ -37,8 +37,12 @@ pub struct WalletUtxo {
     pub tx_hash: String,
     pub output_index: u32,
     pub lovelace: u64,
-    /// True when the UTxO holds only ADA (no native tokens). Collateral inputs must be
-    /// pure-ADA — picking a token-bearing UTxO triggers `CollateralContainsNonADA`.
+    /// True when the UTxO holds only ADA (no native tokens) AND carries no
+    /// reference script. Collateral inputs must be pure-ADA (a token-bearing
+    /// pick triggers `CollateralContainsNonADA`), and coin selection must skip
+    /// ref-script UTxOs entirely: spending one incurs the Conway per-byte
+    /// ref-script fee that generic fee estimation doesn't account for
+    /// (`FeeTooSmallUTxO`), and consumes a deployed reference script.
     pub pure_ada: bool,
 }
 
@@ -54,7 +58,8 @@ impl WalletUtxo {
             .find(|a| a.unit == "lovelace")
             .map(|a| a.quantity.parse().unwrap_or(0))
             .unwrap_or(0);
-        let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace");
+        let pure_ada = u.amount.iter().all(|a| a.unit == "lovelace")
+            && u.reference_script_hash.is_none();
         WalletUtxo {
             tx_hash: u.tx_hash.clone(),
             output_index: u.output_index,

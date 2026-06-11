@@ -283,6 +283,7 @@ mod tests {
                 },
             ],
             inline_datum: Some(hex::encode(datum.to_cbor())),
+            reference_script_hash: None,
         }
     }
 
@@ -295,6 +296,7 @@ mod tests {
                 quantity: lovelace.to_string(),
             }],
             inline_datum: None,
+            reference_script_hash: None,
         }
     }
 

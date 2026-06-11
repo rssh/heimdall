@@ -214,6 +214,23 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Deploy the spos_registry script as a reference script (output #0 at the
+    /// wallet's own address, reclaimable). register_spo references it instead
+    /// of embedding the ~12 KB script twice, which would not fit in the 16 KB
+    /// tx-size limit.
+    DeployRegistryRef {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Build (and with --submit, broadcast) the register_spo tx: bind this
     /// pool's cold-key identity to a Bifrost identity (secp256k1 key + URL),
     /// mint the membership token, insert the registration node into the
@@ -259,6 +276,11 @@ enum Commands {
         /// This SPO's Bifrost endpoint URL (where DKG data is published).
         #[arg(long)]
         bifrost_url: String,
+        /// The registry reference-script UTxO (<tx_hash>:<index>), from
+        /// deploy-registry-ref. Without it the ~12 KB registry script is
+        /// embedded twice and the tx exceeds the 16 KB size limit.
+        #[arg(long)]
+        registry_ref: Option<String>,
         /// Actually submit via Blockfrost (requires passing the min-stake gate).
         #[arg(long)]
         submit: bool,
@@ -485,6 +507,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::DeployRegistryRef {
+            config,
+            blueprint,
+            registry_bootstrap,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit)
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::RegisterSpo {
             config,
             blueprint,
@@ -497,6 +532,7 @@ fn main() {
             bifrost_id_pk,
             bifrost_sig,
             bifrost_url,
+            registry_ref,
             submit,
         } => {
             let cfg = load_config(config.as_deref());
@@ -511,6 +547,7 @@ fn main() {
                 bifrost_id_pk,
                 bifrost_sig,
                 bifrost_url,
+                registry_ref,
                 submit,
             };
             if let Err(e) = run_register_spo(&cfg, &args) {
@@ -1096,13 +1133,37 @@ fn run_bootstrap_registry(
         .block_on(bf_http::fetch_cost_models(&base_url, pid))
         .map_err(|e| format!("fetch cost models: {e}"))?;
 
+    // The one-shot outref cannot be swapped (it parameterizes the policy). If
+    // it carries a reference script, the ledger charges the per-byte
+    // ref-script fee on spending it — fetch the size so the builder prices it
+    // in explicitly (whisky's estimate cannot see it).
+    let reg_tx_hash_hex = hex::encode(reg_tx_id);
+    let one_shot_ref_script_size = match raw
+        .iter()
+        .find(|u| u.tx_hash == reg_tx_hash_hex && u.output_index == reg_index)
+        .and_then(|u| u.reference_script_hash.as_deref())
+    {
+        Some(h) => {
+            let size = rt
+                .block_on(bf_http::fetch_script_size(&base_url, pid, h))
+                .map_err(|e| format!("one-shot ref script size: {e}"))?;
+            eprintln!(
+                "[bootstrap-registry] note: the one-shot outref carries reference script \
+                 {h} ({size} bytes) — adding the Conway ref-script fee"
+            );
+            Some(size)
+        }
+        None => None,
+    };
+
     let built = build_registry_bootstrap_tx(
         &registry,
-        &hex::encode(reg_tx_id),
+        &reg_tx_hash_hex,
         reg_index,
         &wallet_addr,
         &wallet_utxos,
         &key,
+        one_shot_ref_script_size,
         Some(cost_models),
     )
     .map_err(|e| format!("build registry bootstrap tx: {e}"))?;
@@ -1120,6 +1181,70 @@ fn run_bootstrap_registry(
     Ok(())
 }
 
+/// Build (and with `submit`, broadcast) the registry reference-script deploy.
+fn run_deploy_registry_ref(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::spos_registry_script;
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_ref_script_deploy_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_ref_script_deploy_tx(
+        &registry,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build ref-script deploy tx: {e}"))?;
+
+    println!("registry script hash: {}", built.script_hash_hex);
+    println!(
+        "locked with the ref:  {} lovelace (reclaimable: key-locked at the wallet)",
+        built.lovelace
+    );
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    println!("registry ref UTxO:    {tx_hash}:0  (pass as --registry-ref to register-spo)");
+    Ok(())
+}
+
 /// register-spo CLI inputs, bundled (clap hands us a dozen options).
 struct RegisterSpoArgs {
     blueprint: String,
@@ -1132,6 +1257,7 @@ struct RegisterSpoArgs {
     bifrost_id_pk: Option<String>,
     bifrost_sig: Option<String>,
     bifrost_url: String,
+    registry_ref: Option<String>,
     submit: bool,
 }
 
@@ -1386,6 +1512,16 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         window.current_slot, window.epoch_end_slot
     );
 
+    let registry_ref = args
+        .registry_ref
+        .as_deref()
+        .map(|s| {
+            let (tx_id, index) = parse_cardano_outref(s)?;
+            Ok::<_, String>((hex::encode(tx_id), index))
+        })
+        .transpose()
+        .map_err(|e| format!("--registry-ref: {e}"))?;
+
     let req = RegisterSpoRequest {
         registry_script: &registry,
         treasury_script: &treasury,
@@ -1400,6 +1536,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         bifrost_url: args.bifrost_url.as_bytes().to_vec(),
         invalid_before: Some(window.current_slot),
         invalid_hereafter: Some(window.epoch_end_slot),
+        registry_ref,
         cost_models: Some(cost_models),
     };
     let built = build_register_spo_tx(&req).map_err(|e| format!("build register_spo tx: {e}"))?;

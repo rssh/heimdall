@@ -17,6 +17,11 @@ pub struct BfUtxo {
     pub amount: Vec<BfAmount>,
     #[serde(default)]
     pub inline_datum: Option<String>,
+    /// Hash of a reference script attached to the UTxO. Spending such a UTxO
+    /// incurs the Conway per-byte ref-script fee, which generic fee
+    /// estimation cannot see — coin selection must avoid these.
+    #[serde(default)]
+    pub reference_script_hash: Option<String>,
 }
 
 /// Resolve the Blockfrost base URL: explicit `custom` (e.g. yaci's http://localhost:8080/api/v1),
@@ -73,13 +78,43 @@ pub async fn fetch_address_utxos(
     Ok(all)
 }
 
-/// The current slot and the slot of the next epoch boundary, for the
-/// register_spo validity window (`invalid_before` / `invalid_hereafter`).
+/// `serialised_size` (bytes) of an on-chain script, from `/scripts/{hash}` —
+/// the input to the Conway ref-script fee when a ref-script UTxO must be spent.
+pub async fn fetch_script_size(
+    base_url: &str,
+    project_id: &str,
+    script_hash: &str,
+) -> Result<u64, String> {
+    let url = format!("{base_url}/scripts/{script_hash}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("project_id", project_id)
+        .send()
+        .await
+        .map_err(|e| format!("script request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "script http {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("script json: {e}"))?;
+    v.get("serialised_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "script: missing serialised_size".to_string())
+}
+
+/// The current slot and the upper validity bound at the epoch boundary, for
+/// the register_spo validity window (`invalid_before` / `invalid_hereafter`).
 #[derive(Debug, Clone, Copy)]
 pub struct EpochWindow {
     pub current_slot: u64,
-    /// First slot of the NEXT epoch: `current_slot + (epoch end_time − block
-    /// time)`. Valid post-Shelley, where 1 slot = 1 second.
+    /// One slot BEFORE the next epoch boundary (`current_slot + (epoch
+    /// end_time − block time) − 1`; 1 slot = 1 second post-Shelley). The
+    /// boundary slot itself sits at the ledger's time-translation horizon —
+    /// a Plutus tx with `invalid_hereafter` exactly there is rejected with
+    /// `TimeTranslationPastHorizon` when the script context is built.
     pub epoch_end_slot: u64,
 }
 
@@ -124,7 +159,7 @@ pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<Epoc
     let remaining = end_time.saturating_sub(block_time);
     Ok(EpochWindow {
         current_slot,
-        epoch_end_slot: current_slot + remaining,
+        epoch_end_slot: (current_slot + remaining).saturating_sub(1),
     })
 }
 
