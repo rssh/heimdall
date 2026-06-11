@@ -21,8 +21,7 @@
 
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
-use pallas_primitives::conway::{Constr, PlutusData, Tx, VKeyWitness};
-use pallas_primitives::{BoundedBytes, MaybeIndefArray};
+use pallas_primitives::conway::{Tx, VKeyWitness};
 use pallas_traverse::ComputeHash;
 use pallas_wallet::PrivateKey;
 use whisky::*;
@@ -67,26 +66,14 @@ impl WalletUtxo {
 
 /// Encode the treasury oracle datum: `Constr(constructor, [BoundedBytes(btc_tx)])`.
 ///
-/// CBOR tags for Plutus constructors 0–6 are 121–127; constructors 7+
-/// use tag 102 with an explicit `any_constructor` field.
-/// Constructor 0 (tag 121) = unconfirmed TM tx.
-/// Constructor 1 (tag 122) = confirmed (set by Binocular after Bitcoin proof).
+/// Constructor 0 = unconfirmed TM tx; 1 = confirmed (set by Binocular after a
+/// Bitcoin proof). Canonical encoding via `cardano::plutus::constr` (see that
+/// module for the tag / canonical-encoding rules).
 fn encode_datum_hex(btc_tx: &[u8], constructor: u8) -> String {
-    let (tag, any_constructor) = if constructor <= 6 {
-        (121u64 + constructor as u64, None)
-    } else {
-        (102u64, Some(constructor as u64))
-    };
-    let datum = PlutusData::Constr(Constr {
-        tag,
-        any_constructor,
-        // Canonical plutus-core encoding: non-empty Constr fields are indefinite-length. Matches
-        // what a Haskell node produces and what the encoding-sensitive Rust uplc evaluator
-        // (whisky / aiken simulate) expects — see treasury_info::constr.
-        fields: MaybeIndefArray::Indef(vec![PlutusData::BoundedBytes(BoundedBytes::from(
-            btc_tx.to_vec(),
-        ))]),
-    });
+    let datum = crate::cardano::plutus::constr(
+        u64::from(constructor),
+        vec![crate::cardano::plutus::bytes(btc_tx)],
+    );
     let cbor = minicbor::to_vec(&datum).expect("datum CBOR encode");
     hex::encode(cbor)
 }
@@ -269,6 +256,7 @@ pub fn build_oracle_update_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pallas_primitives::conway::PlutusData;
 
     #[test]
     fn encode_datum_is_constr_0() {

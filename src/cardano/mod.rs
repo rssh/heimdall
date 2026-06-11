@@ -20,6 +20,7 @@ pub mod mpf;
 pub mod pallas_source;
 pub mod pegin_datum;
 pub mod pegin_source;
+pub mod plutus;
 pub mod pegout_datum;
 pub mod publish;
 pub mod registry;

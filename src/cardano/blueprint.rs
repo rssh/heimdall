@@ -24,7 +24,9 @@ use pallas_addresses::{
 };
 use pallas_codec::minicbor;
 use pallas_crypto::hash::Hasher;
-use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray, PlutusData};
+use pallas_primitives::{MaybeIndefArray, PlutusData};
+
+use crate::cardano::plutus::{bytes, int_from_u64};
 
 /// Blueprint title of the spos_registry minting policy (the membership-token
 /// policy; its hash is the `registry_policy_id`).
@@ -151,18 +153,6 @@ pub fn apply_params(
     })
 }
 
-fn param_bytes(b: &[u8]) -> PlutusData {
-    PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
-}
-
-/// Plutus `Int` param. Output indexes never approach `i64::MAX`; reject rather
-/// than silently wrap to a negative Int (which would derive a wrong-but-
-/// plausible policy id).
-fn param_int(n: u64) -> PlutusData {
-    let n = i64::try_from(n).expect("integer param exceeds i64::MAX");
-    PlutusData::BigInt(BigInt::Int(n.into()))
-}
-
 /// `spos_registry` parameterized by its one-shot bootstrap output ref
 /// (`bootstrap_tx_id`, `bootstrap_output_index` — two separate params, not an
 /// `OutputReference`). The resulting hash is the `registry_policy_id`.
@@ -175,8 +165,8 @@ pub fn spos_registry_script(
     apply_params(
         &code,
         &[
-            param_bytes(bootstrap_tx_id),
-            param_int(bootstrap_output_index),
+            bytes(bootstrap_tx_id),
+            int_from_u64(bootstrap_output_index),
         ],
     )
 }
@@ -187,7 +177,7 @@ pub fn treasury_info_script(
     registry_policy_id: &[u8; 28],
 ) -> Result<ParameterizedScript, BlueprintError> {
     let code = validator_compiled_code(blueprint_json, TREASURY_INFO_TITLE)?;
-    apply_params(&code, &[param_bytes(registry_policy_id)])
+    apply_params(&code, &[bytes(registry_policy_id)])
 }
 
 #[cfg(test)]
@@ -225,7 +215,7 @@ mod tests {
     fn apply_params_matches_aiken_blueprint_apply() {
         let applied = apply_params(
             TREASURY_INFO_CODE.trim(),
-            &[param_bytes(&REGISTRY_POLICY_FOR_VECTOR)],
+            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
         )
         .unwrap();
         assert_eq!(applied.hash_hex(), TREASURY_INFO_APPLIED_HASH);
@@ -235,7 +225,7 @@ mod tests {
     fn enterprise_address_is_script_keyed() {
         let applied = apply_params(
             TREASURY_INFO_CODE.trim(),
-            &[param_bytes(&REGISTRY_POLICY_FOR_VECTOR)],
+            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
         )
         .unwrap();
         let addr = applied.enterprise_address(Network::Testnet);
@@ -254,7 +244,7 @@ mod tests {
     fn enterprise_address_mainnet_prefix() {
         let applied = apply_params(
             TREASURY_INFO_CODE.trim(),
-            &[param_bytes(&REGISTRY_POLICY_FOR_VECTOR)],
+            &[bytes(&REGISTRY_POLICY_FOR_VECTOR)],
         )
         .unwrap();
         let addr = applied.enterprise_address(Network::Mainnet);
@@ -266,7 +256,7 @@ mod tests {
     // which we encode ourselves).
     #[test]
     fn apply_params_rejects_garbage_code() {
-        let err = apply_params("deadbeef", &[param_int(1)]).unwrap_err();
+        let err = apply_params("deadbeef", &[int_from_u64(1)]).unwrap_err();
         assert!(matches!(err, BlueprintError::Uplc(_)), "{err}");
     }
 

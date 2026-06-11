@@ -19,6 +19,7 @@
 use pallas_primitives::PlutusData;
 
 use crate::cardano::bf_http;
+use crate::cardano::plutus;
 
 /// A peg-out the SPO must fulfil in the TM: pay `destination_script_pubkey` the GROSS
 /// `amount_sat` minus the per-peg-out protocol fee (the fee deduction happens in
@@ -39,30 +40,16 @@ pub struct PegOutRequestData {
 /// time and a Haskell node accepts either; rejecting the 102 form would drop a legitimate,
 /// completable peg-out (the sibling registry/treasury decoders already accept both).
 pub fn extract_destination_spk(data: &PlutusData) -> Result<Vec<u8>, String> {
-    let c = match data {
-        PlutusData::Constr(c) => c,
-        _ => return Err("PegOutDatum: top level not Constr".into()),
-    };
-    let ctor = match c.tag {
-        121..=127 => c.tag - 121,
-        102 => c.any_constructor.unwrap_or(u64::MAX),
-        other => return Err(format!("PegOutDatum: not a Constr tag ({other})")),
-    };
-    if ctor != 0 {
-        return Err(format!("PegOutDatum: expected constructor 0, got {ctor}"));
-    }
-    if c.fields.len() != 3 {
+    let fields = plutus::constr_fields(data, 0).map_err(|e| format!("PegOutDatum: {e}"))?;
+    if fields.len() != 3 {
         return Err(format!(
             "PegOutDatum: expected 3 fields, got {}",
-            c.fields.len()
+            fields.len()
         ));
     }
-    match &c.fields[1] {
-        PlutusData::BoundedBytes(b) => Ok(b.clone().into()),
-        _ => Err(
-            "PegOutDatum: field[1] (source_chain_destination_address) is not BoundedBytes".into(),
-        ),
-    }
+    plutus::field_bytes(fields, 1).map_err(|_| {
+        "PegOutDatum: field[1] (source_chain_destination_address) is not BoundedBytes".to_string()
+    })
 }
 
 /// Fetch every PegOut request at `pegout_address`, identified by carrying the `fbtc_unit` token

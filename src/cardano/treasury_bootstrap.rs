@@ -30,8 +30,8 @@
 use bitcoin::hashes::{Hash as _, sha256};
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
-use pallas_primitives::conway::{Constr, Tx, VKeyWitness};
-use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray, PlutusData};
+use pallas_primitives::PlutusData;
+use pallas_primitives::conway::{Tx, VKeyWitness};
 use pallas_traverse::ComputeHash;
 use pallas_wallet::PrivateKey;
 use whisky::*;
@@ -39,49 +39,15 @@ use whisky_pallas::WhiskyPallas;
 
 use crate::cardano::blueprint::ParameterizedScript;
 use crate::cardano::mpf;
+use crate::cardano::plutus::{bytes, constr, int_from_u64};
 use crate::cardano::publish::WalletUtxo;
 use crate::cardano::treasury_info::TreasuryInfoDatum;
 use crate::cardano::wallet::pub_key_hash_hex;
 use crate::epoch::state::{EpochError, EpochResult};
 
-// ---------------------------------------------------------------------------
-// Plutus-data helpers (CBOR constructor tags 121.. = Constr 0.., 102 for 7+)
-// ---------------------------------------------------------------------------
-
-fn bytes(b: &[u8]) -> PlutusData {
-    PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
-}
-
-/// Plutus `Int`. Callers never exceed `u32` output indexes in practice; values
-/// above `i64::MAX` are rejected rather than silently wrapped.
-fn int(n: u64) -> PlutusData {
-    let n = i64::try_from(n).expect("output index exceeds i64::MAX");
-    PlutusData::BigInt(BigInt::Int(n.into()))
-}
-
-/// A Plutus `Constr` in the CANONICAL plutus-core encoding: indefinite-length
-/// fields when non-empty, definite empty otherwise. Canonical form is required
-/// twice over: `hash_output_ref` must byte-match the on-chain `serialiseData`,
-/// and the Rust uplc evaluator (whisky / `aiken tx simulate`) compares datums
-/// and re-serialises redeemers ENCODING-SENSITIVELY — a definite-encoded
-/// redeemer/datum fails simulation even though a Haskell node accepts it.
-fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
-    let (tag, any_constructor) = if c <= 6 {
-        (121 + c, None)
-    } else {
-        (102, Some(c))
-    };
-    let fields = if fields.is_empty() {
-        MaybeIndefArray::Def(fields)
-    } else {
-        MaybeIndefArray::Indef(fields)
-    };
-    PlutusData::Constr(Constr {
-        tag,
-        any_constructor,
-        fields,
-    })
-}
+// Plutus encode/decode (constructor tags, canonical encoding) live in
+// `crate::cardano::plutus`. `hash_output_ref` relies on `constr`'s canonical
+// encoding to byte-match the on-chain `serialiseData` of the OutputReference.
 
 // ---------------------------------------------------------------------------
 // hash_output_ref — the one-shot NFT asset name
@@ -103,7 +69,7 @@ pub fn hash_output_ref(tx_id: &[u8; 32], output_index: u64) -> [u8; 32] {
 /// the redeemer is the name we mint by construction.
 #[must_use]
 pub fn output_ref_plutus_data(tx_id: &[u8; 32], output_index: u64) -> PlutusData {
-    constr(0, vec![bytes(tx_id), int(output_index)])
+    constr(0, vec![bytes(tx_id), int_from_u64(output_index)])
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +332,7 @@ mod tests {
     use crate::cardano::blueprint;
     use crate::cardano::wallet::derive_payment_key;
     use pallas_addresses::Address;
+    use pallas_primitives::BoundedBytes;
     use pallas_primitives::conway::{DatumOption, PseudoTransactionOutput};
 
     // sha2_256(d8799f5820 || aa*32 || <index> || ff) — independently computed

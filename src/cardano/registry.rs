@@ -30,8 +30,9 @@
 use std::collections::BTreeMap;
 
 use pallas_codec::minicbor;
-use pallas_primitives::conway::Constr;
-use pallas_primitives::{BoundedBytes, MaybeIndefArray, PlutusData};
+use pallas_primitives::PlutusData;
+
+use crate::cardano::plutus::{self, bytes, constr};
 
 /// Asset name of the root element's NFT (`registration_root_key` in
 /// `spos_registry.ak`).
@@ -125,62 +126,23 @@ impl std::fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-// ---------------------------------------------------------------------------
-// Plutus-data helpers (CBOR constructor tags 121.. = Constr 0.., 102 for 7+)
-// ---------------------------------------------------------------------------
-
-fn bytes(b: &[u8]) -> PlutusData {
-    PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
-}
-
-/// A Plutus `Constr` with constructor index `c` (0..=6 → tag 121+c; 7+ → tag 102).
-///
-/// Fields use the CANONICAL plutus-core encoding (indefinite-length array when
-/// non-empty, definite empty otherwise): the linked-list validator compares
-/// continued datums structurally, and the Rust uplc evaluator — unlike a
-/// Haskell node — is encoding-sensitive, so a definite-encoded datum fails
-/// pre-validation/simulation (see `treasury_info::constr`).
-fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
-    let (tag, any_constructor) = if c <= 6 {
-        (121 + c, None)
-    } else {
-        (102, Some(c))
-    };
-    let fields = if fields.is_empty() {
-        MaybeIndefArray::Def(fields)
-    } else {
-        MaybeIndefArray::Indef(fields)
-    };
-    PlutusData::Constr(Constr {
-        tag,
-        any_constructor,
-        fields,
-    })
-}
-
-/// Constructor index and fields of a `Constr`.
-fn constr_parts(data: &PlutusData) -> Result<(u64, &[PlutusData]), RegistryError> {
-    let c = match data {
-        PlutusData::Constr(c) => c,
-        _ => return Err(RegistryError::NotConstr),
-    };
-    let ctor = match c.tag {
-        121..=127 => c.tag - 121,
-        102 => c.any_constructor.unwrap_or(u64::MAX),
-        other => return Err(RegistryError::WrongConstructor(other)),
-    };
-    Ok((ctor, &c.fields))
-}
-
-/// Fields of a `Constr` whose constructor index must be `expected`.
-fn constr_fields(data: &PlutusData, expected: u64) -> Result<&[PlutusData], RegistryError> {
-    let (ctor, fields) = constr_parts(data)?;
-    if ctor != expected {
-        return Err(RegistryError::WrongConstructor(ctor));
+impl From<plutus::PlutusError> for RegistryError {
+    fn from(e: plutus::PlutusError) -> Self {
+        match e {
+            plutus::PlutusError::NotConstr => Self::NotConstr,
+            plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
+            plutus::PlutusError::MissingField(i) | plutus::PlutusError::NotBytes(i) => {
+                Self::NotBytes(i)
+            }
+        }
     }
-    Ok(fields)
 }
 
+// Plutus encode/decode (constructor tags, canonical encoding, `as_constr` /
+// `constr_fields` / `field_bytes`) live in `crate::cardano::plutus`.
+
+/// Field-count guard with this module's `FieldCount` error (the shared decoder
+/// only validates field *types*, not arity).
 fn expect_len(fields: &[PlutusData], expected: usize) -> Result<(), RegistryError> {
     if fields.len() != expected {
         return Err(RegistryError::FieldCount {
@@ -189,13 +151,6 @@ fn expect_len(fields: &[PlutusData], expected: usize) -> Result<(), RegistryErro
         });
     }
     Ok(())
-}
-
-fn field_bytes(fields: &[PlutusData], i: usize) -> Result<Vec<u8>, RegistryError> {
-    match fields.get(i) {
-        Some(PlutusData::BoundedBytes(b)) => Ok(b.clone().into()),
-        _ => Err(RegistryError::NotBytes(i)),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,35 +186,35 @@ impl RegistryElement {
     }
 
     pub fn from_plutus_data(pd: &PlutusData) -> Result<Self, RegistryError> {
-        let fields = constr_fields(pd, 0)?;
+        let fields = plutus::constr_fields(pd, 0)?;
         expect_len(fields, 2)?;
 
-        let (data_ctor, data_fields) = constr_parts(&fields[0])?;
+        let (data_ctor, data_fields) = plutus::as_constr(&fields[0])?;
         let data = match data_ctor {
             0 => {
                 // Root { data: ListRootData }; ListRootData must be Constr(0, []).
                 expect_len(data_fields, 1)?;
-                let root_fields = constr_fields(&data_fields[0], 0)?;
+                let root_fields = plutus::constr_fields(&data_fields[0], 0)?;
                 expect_len(root_fields, 0)?;
                 ElementData::Root
             }
             1 => {
                 expect_len(data_fields, 1)?;
-                let node_fields = constr_fields(&data_fields[0], 0)?;
+                let node_fields = plutus::constr_fields(&data_fields[0], 0)?;
                 expect_len(node_fields, 2)?;
                 ElementData::Node(RegistrationNodeData {
-                    bifrost_id_pk: field_bytes(node_fields, 0)?,
-                    bifrost_url: field_bytes(node_fields, 1)?,
+                    bifrost_id_pk: plutus::field_bytes(node_fields, 0)?,
+                    bifrost_url: plutus::field_bytes(node_fields, 1)?,
                 })
             }
             other => return Err(RegistryError::WrongConstructor(other)),
         };
 
-        let (link_ctor, link_fields) = constr_parts(&fields[1])?;
+        let (link_ctor, link_fields) = plutus::as_constr(&fields[1])?;
         let link = match link_ctor {
             0 => {
                 expect_len(link_fields, 1)?;
-                Some(field_bytes(link_fields, 0)?)
+                Some(plutus::field_bytes(link_fields, 0)?)
             }
             1 => {
                 expect_len(link_fields, 0)?;

@@ -24,10 +24,10 @@
 //! testable now.
 
 use pallas_codec::minicbor;
-use pallas_primitives::conway::Constr;
-use pallas_primitives::{BigInt, BoundedBytes, MaybeIndefArray, PlutusData};
+use pallas_primitives::PlutusData;
 
 use crate::cardano::mpf;
+use crate::cardano::plutus::{self, array, bytes, constr, int};
 
 /// The `treasury_info` state datum (`TreasuryDatum`). All fields are on-chain
 /// `ByteArray`s; `bifrost_identity_root` is the 32-byte MPF root.
@@ -73,67 +73,23 @@ impl std::fmt::Display for TreasuryInfoError {
 
 impl std::error::Error for TreasuryInfoError {}
 
-// ---------------------------------------------------------------------------
-// Plutus-data helpers (CBOR constructor tags 121.. = Constr 0.., 102 for 7+)
-// ---------------------------------------------------------------------------
-
-fn bytes(b: &[u8]) -> PlutusData {
-    PlutusData::BoundedBytes(BoundedBytes::from(b.to_vec()))
-}
-
-fn int(n: i64) -> PlutusData {
-    PlutusData::BigInt(BigInt::Int(n.into()))
-}
-
-/// A Plutus `Constr` with constructor index `c` (0..=6 → tag 121+c; 7+ → tag 102).
-///
-/// Fields use the CANONICAL plutus-core encoding: indefinite-length array when
-/// non-empty, definite empty (`0x80`) when empty. Haskell plutus-core is
-/// encoding-insensitive, but the Rust uplc evaluator (aiken/whisky/Mesh
-/// simulation) preserves the wire variant through decode and its `EqualsData` /
-/// `SerialiseData` are encoding-sensitive — a definite-encoded datum makes
-/// on-chain structural equality spuriously fail under Rust pre-validation.
-fn constr(c: u64, fields: Vec<PlutusData>) -> PlutusData {
-    let (tag, any_constructor) = if c <= 6 {
-        (121 + c, None)
-    } else {
-        (102, Some(c))
-    };
-    let fields = if fields.is_empty() {
-        MaybeIndefArray::Def(fields)
-    } else {
-        MaybeIndefArray::Indef(fields)
-    };
-    PlutusData::Constr(Constr {
-        tag,
-        any_constructor,
-        fields,
-    })
-}
-
-/// Constr fields if `data` is a `Constr` with constructor index `expected`.
-fn constr_fields(data: &PlutusData, expected: u64) -> Result<&[PlutusData], TreasuryInfoError> {
-    let c = match data {
-        PlutusData::Constr(c) => c,
-        _ => return Err(TreasuryInfoError::NotConstr),
-    };
-    let ctor = match c.tag {
-        121..=127 => c.tag - 121,
-        102 => c.any_constructor.unwrap_or(u64::MAX),
-        other => return Err(TreasuryInfoError::WrongConstructor(other)),
-    };
-    if ctor != expected {
-        return Err(TreasuryInfoError::WrongConstructor(ctor));
-    }
-    Ok(&c.fields)
-}
-
-fn field_bytes(fields: &[PlutusData], i: usize) -> Result<Vec<u8>, TreasuryInfoError> {
-    match fields.get(i) {
-        Some(PlutusData::BoundedBytes(b)) => Ok(b.clone().into()),
-        _ => Err(TreasuryInfoError::NotBytes(i)),
+impl From<plutus::PlutusError> for TreasuryInfoError {
+    fn from(e: plutus::PlutusError) -> Self {
+        match e {
+            plutus::PlutusError::NotConstr => Self::NotConstr,
+            plutus::PlutusError::WrongConstructor { got, .. } => Self::WrongConstructor(got),
+            // The shared `field_bytes` distinguishes missing vs wrong-type; this
+            // module's `from_plutus_data` checks field count first, so both map
+            // to NotBytes (preserving the prior behaviour).
+            plutus::PlutusError::MissingField(i) | plutus::PlutusError::NotBytes(i) => {
+                Self::NotBytes(i)
+            }
+        }
     }
 }
+
+// Plutus encode/decode (constructor tags, canonical encoding) live in
+// `crate::cardano::plutus`.
 
 // ---------------------------------------------------------------------------
 // TreasuryDatum
@@ -161,23 +117,23 @@ impl TreasuryInfoDatum {
     }
 
     pub fn from_plutus_data(data: &PlutusData) -> Result<Self, TreasuryInfoError> {
-        let fields = constr_fields(data, 0)?;
+        let fields = plutus::constr_fields(data, 0)?;
         if fields.len() != 4 {
             return Err(TreasuryInfoError::FieldCount {
                 expected: 4,
                 got: fields.len(),
             });
         }
-        let root_bytes = field_bytes(fields, 0)?;
+        let root_bytes = plutus::field_bytes(fields, 0)?;
         let bifrost_identity_root: mpf::Hash = root_bytes
             .as_slice()
             .try_into()
             .map_err(|_| TreasuryInfoError::BadRootLen(root_bytes.len()))?;
         Ok(TreasuryInfoDatum {
             bifrost_identity_root,
-            current_treasury_address: field_bytes(fields, 1)?,
-            current_treasury_utxo_id: field_bytes(fields, 2)?,
-            current_spos_frost_key: field_bytes(fields, 3)?,
+            current_treasury_address: plutus::field_bytes(fields, 1)?,
+            current_treasury_utxo_id: plutus::field_bytes(fields, 2)?,
+            current_spos_frost_key: plutus::field_bytes(fields, 3)?,
         })
     }
 }
@@ -207,14 +163,7 @@ pub fn treasury_spend_redeemer(config_ref_input_index: i64, new: &TreasuryInfoDa
 /// `SposRegistry.Register` redeemer's `bifrost_identity_absence_proof`.
 #[must_use]
 pub fn proof_to_plutus_data(proof: &mpf::Proof) -> PlutusData {
-    let steps: Vec<PlutusData> = proof.iter().map(step_to_plutus_data).collect();
-    // Canonical plutus-core list encoding: indefinite when non-empty (see `constr`).
-    let steps = if steps.is_empty() {
-        MaybeIndefArray::Def(steps)
-    } else {
-        MaybeIndefArray::Indef(steps)
-    };
-    PlutusData::Array(steps)
+    array(proof.iter().map(step_to_plutus_data).collect())
 }
 
 fn step_to_plutus_data(step: &mpf::ProofStep) -> PlutusData {
@@ -286,6 +235,7 @@ pub fn apply_registration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pallas_primitives::MaybeIndefArray;
 
     fn pairs(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         (0..n)
