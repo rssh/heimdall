@@ -73,6 +73,61 @@ pub async fn fetch_address_utxos(
     Ok(all)
 }
 
+/// The current slot and the slot of the next epoch boundary, for the
+/// register_spo validity window (`invalid_before` / `invalid_hereafter`).
+#[derive(Debug, Clone, Copy)]
+pub struct EpochWindow {
+    pub current_slot: u64,
+    /// First slot of the NEXT epoch: `current_slot + (epoch end_time − block
+    /// time)`. Valid post-Shelley, where 1 slot = 1 second.
+    pub epoch_end_slot: u64,
+}
+
+/// Fetch the epoch-boundary window from `/blocks/latest` (slot + wall time)
+/// and `/epochs/latest` (end time). A tx with `invalid_hereafter =
+/// epoch_end_slot` cannot land in a later epoch than the one it was built in.
+pub async fn fetch_epoch_window(base_url: &str, project_id: &str) -> Result<EpochWindow, String> {
+    let client = reqwest::Client::new();
+    let get = |path: &str| {
+        let url = format!("{base_url}/{path}");
+        let client = client.clone();
+        let project_id = project_id.to_string();
+        async move {
+            let resp = client
+                .get(&url)
+                .header("project_id", project_id)
+                .send()
+                .await
+                .map_err(|e| format!("{url}: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "{url}: http {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| format!("{url}: json: {e}"))
+        }
+    };
+    let block = get("blocks/latest").await?;
+    let epoch = get("epochs/latest").await?;
+    let field = |v: &serde_json::Value, name: &str, what: &str| -> Result<u64, String> {
+        v.get(name)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("{what}: missing/non-numeric `{name}`"))
+    };
+    let current_slot = field(&block, "slot", "blocks/latest")?;
+    let block_time = field(&block, "time", "blocks/latest")?;
+    let end_time = field(&epoch, "end_time", "epochs/latest")?;
+    let remaining = end_time.saturating_sub(block_time);
+    Ok(EpochWindow {
+        current_slot,
+        epoch_end_slot: current_slot + remaining,
+    })
+}
+
 /// Fetch the network's live Plutus cost models (ordered int arrays) from
 /// `/epochs/latest/parameters`, returned as `[PlutusV1, PlutusV2, PlutusV3]`.
 ///

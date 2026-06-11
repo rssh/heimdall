@@ -195,6 +195,74 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Bootstrap the spos_registry linked list: spend the one-shot outref that
+    /// parameterizes the registry policy and mint the "reg-root" anchor NFT to
+    /// the registry script address. Prints the signed tx, submits only with
+    /// --submit. Must confirm before any register-spo can be built.
+    BootstrapRegistry {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref, as
+        /// <cardano_tx_hash>:<index>. Must still be an unspent wallet UTxO,
+        /// and the same value that parameterized bootstrap-treasury-info.
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Actually submit via Blockfrost (default: build + print only).
+        #[arg(long)]
+        submit: bool,
+    },
+    /// Build (and with --submit, broadcast) the register_spo tx: bind this
+    /// pool's cold-key identity to a Bifrost identity (secp256k1 key + URL),
+    /// mint the membership token, insert the registration node into the
+    /// on-chain linked list and advance the treasury bifrost_identity_root.
+    /// Submission is gated on the R2 min-stake check
+    /// (cardano.min_stake_lovelace vs the pool's epoch-snapshot active stake).
+    RegisterSpo {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json).
+        #[arg(long)]
+        blueprint: String,
+        /// The spos_registry one-shot bootstrap output ref (<tx_hash>:<index>)
+        /// that parameterizes the registry policy (and through it treasury_info).
+        #[arg(long)]
+        registry_bootstrap: String,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        #[arg(long)]
+        treasury_nft_name: String,
+        /// Pool cold signing key: 32-byte hex, or a path to a file holding that
+        /// hex or a cardano-cli TextEnvelope (cborHex "5820" || 32 bytes).
+        /// Omit for the air-gapped flow (--cold-vkey + --cold-sig).
+        #[arg(long)]
+        cold_skey: Option<String>,
+        /// Air-gapped: 32-byte cold verification key, hex.
+        #[arg(long)]
+        cold_vkey: Option<String>,
+        /// Air-gapped: 64-byte Ed25519 signature (hex) over the registration
+        /// message. Run without it first to print the exact message to sign.
+        #[arg(long)]
+        cold_sig: Option<String>,
+        /// Bifrost identity secret key: 32-byte hex or a path to a file with
+        /// it. Omit for the air-gapped flow (--bifrost-id-pk + --bifrost-sig).
+        #[arg(long)]
+        bifrost_skey: Option<String>,
+        /// Air-gapped: 32-byte x-only bifrost public key, hex.
+        #[arg(long)]
+        bifrost_id_pk: Option<String>,
+        /// Air-gapped: 64-byte BIP340 Schnorr signature (hex) over
+        /// sha2_256(registration message).
+        #[arg(long)]
+        bifrost_sig: Option<String>,
+        /// This SPO's Bifrost endpoint URL (where DKG data is published).
+        #[arg(long)]
+        bifrost_url: String,
+        /// Actually submit via Blockfrost (requires passing the min-stake gate).
+        #[arg(long)]
+        submit: bool,
+    },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
     /// discovered deposits into a new treasury output[0]. Key-path spend signed
@@ -401,6 +469,51 @@ fn main() {
                 &frost_key,
                 submit,
             ) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::BootstrapRegistry {
+            config,
+            blueprint,
+            registry_bootstrap,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_bootstrap_registry(&cfg, &blueprint, &registry_bootstrap, submit) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::RegisterSpo {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+            cold_skey,
+            cold_vkey,
+            cold_sig,
+            bifrost_skey,
+            bifrost_id_pk,
+            bifrost_sig,
+            bifrost_url,
+            submit,
+        } => {
+            let cfg = load_config(config.as_deref());
+            let args = RegisterSpoArgs {
+                blueprint,
+                registry_bootstrap,
+                treasury_nft_name,
+                cold_skey,
+                cold_vkey,
+                cold_sig,
+                bifrost_skey,
+                bifrost_id_pk,
+                bifrost_sig,
+                bifrost_url,
+                submit,
+            };
+            if let Err(e) = run_register_spo(&cfg, &args) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -922,6 +1035,393 @@ fn run_bootstrap_treasury_info(
     let tx_hash = rt
         .block_on(api.transactions_submit(cbor))
         .map_err(|e| format!("blockfrost submit: {e}"))?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
+/// Submit a signed tx (hex) via Blockfrost; returns the tx hash.
+fn submit_tx_blockfrost(
+    cfg: &HeimdallConfig,
+    project_id: &str,
+    signed_tx_hex: &str,
+    rt: &tokio::runtime::Runtime,
+) -> Result<String, String> {
+    let cbor = hex::decode(signed_tx_hex).map_err(|e| e.to_string())?;
+    let mut settings = blockfrost::BlockFrostSettings::new();
+    if let Some(url) = cfg.cardano.blockfrost_url.as_deref() {
+        settings.base_url = Some(url.to_string());
+    }
+    let api = blockfrost::BlockfrostAPI::new(project_id, settings);
+    rt.block_on(api.transactions_submit(cbor))
+        .map_err(|e| format!("blockfrost submit: {e}"))
+}
+
+/// Build (and with `submit`, broadcast) the registry-list bootstrap: the
+/// one-shot `Bootstrap` mint creating the `"reg-root"` anchor element.
+/// See `heimdall::cardano::register_spo`.
+fn run_bootstrap_registry(
+    cfg: &HeimdallConfig,
+    blueprint_path: &str,
+    registry_bootstrap: &str,
+    submit: bool,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::spos_registry_script;
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::build_registry_bootstrap_tx;
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(blueprint_path)
+        .map_err(|e| format!("read blueprint {blueprint_path}: {e}"))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = raw.iter().map(WalletUtxo::from_bf).collect();
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+
+    let built = build_registry_bootstrap_tx(
+        &registry,
+        &hex::encode(reg_tx_id),
+        reg_index,
+        &wallet_addr,
+        &wallet_utxos,
+        &key,
+        Some(cost_models),
+    )
+    .map_err(|e| format!("build registry bootstrap tx: {e}"))?;
+
+    println!("registry policy id:   {}", built.policy_id_hex);
+    println!("registry address:     {}", built.script_address);
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
+    println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
+/// register-spo CLI inputs, bundled (clap hands us a dozen options).
+struct RegisterSpoArgs {
+    blueprint: String,
+    registry_bootstrap: String,
+    treasury_nft_name: String,
+    cold_skey: Option<String>,
+    cold_vkey: Option<String>,
+    cold_sig: Option<String>,
+    bifrost_skey: Option<String>,
+    bifrost_id_pk: Option<String>,
+    bifrost_sig: Option<String>,
+    bifrost_url: String,
+    submit: bool,
+}
+
+/// Parse a 32-byte secret-key argument: inline hex, a file containing hex, or
+/// a cardano-cli TextEnvelope file (`cborHex` = `"5820" || 32 bytes`).
+fn parse_key32(arg: &str, what: &str) -> Result<[u8; 32], String> {
+    let content = if std::path::Path::new(arg).is_file() {
+        std::fs::read_to_string(arg).map_err(|e| format!("{what}: read {arg}: {e}"))?
+    } else {
+        arg.to_string()
+    };
+    let trimmed = content.trim();
+    let hex_str = if trimmed.starts_with('{') {
+        let v: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("{what}: TextEnvelope JSON: {e}"))?;
+        v.get("cborHex")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("{what}: TextEnvelope has no cborHex"))?
+            .strip_prefix("5820")
+            .ok_or_else(|| format!("{what}: cborHex is not a 32-byte key (5820…)"))?
+            .to_string()
+    } else {
+        trimmed.to_string()
+    };
+    parse_hex_n(&hex_str, what)
+}
+
+/// Parse an inline hex argument of exactly `N` bytes.
+fn parse_hex_n<const N: usize>(arg: &str, what: &str) -> Result<[u8; N], String> {
+    hex::decode(arg.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| format!("{what}: expected {N} bytes of hex"))
+}
+
+/// Bech32 (`pool1…`) form of the 28-byte pool key hash, as Blockfrost expects.
+fn pool_id_bech32(pool_id: &[u8; 28]) -> String {
+    use bitcoin::bech32::{self, Hrp};
+    bech32::encode::<bech32::Bech32>(Hrp::parse("pool").expect("valid hrp"), pool_id)
+        .expect("bech32 encode pool id")
+}
+
+/// Build (and with `--submit`, broadcast) the register_spo tx. Identities come
+/// from local secret keys or from the air-gapped (vkey + signature) flow; the
+/// R2 min-stake gate must pass before anything is submitted.
+fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), String> {
+    use bitcoin::hashes::{Hash as _, sha256};
+    use bitcoin::key::Secp256k1;
+    use bitcoin::secp256k1::{Keypair, Message};
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::blueprint::{spos_registry_script, treasury_info_script};
+    use heimdall::cardano::publish::WalletUtxo;
+    use heimdall::cardano::register_spo::{
+        RegisterSpoRequest, RegistrationSignatures, build_register_spo_tx, pool_id_from_cold_vkey,
+        registration_message, verify_registration,
+    };
+    use heimdall::cardano::registry::REGISTRATION_ROOT_KEY;
+    use heimdall::cardano::stake::{check_min_stake, fetch_pool_stake};
+    use heimdall::cardano::wallet::{derive_payment_key, wallet_address_from_mnemonic};
+    use pallas_crypto::key::ed25519;
+
+    let mnemonic = resolve_mnemonic(cfg)?;
+    let key = derive_payment_key(&mnemonic)?;
+    let wallet_addr = wallet_address_from_mnemonic(&mnemonic)?;
+
+    let blueprint_json = std::fs::read_to_string(&args.blueprint)
+        .map_err(|e| format!("read blueprint {}: {e}", args.blueprint))?;
+    let (reg_tx_id, reg_index) = parse_cardano_outref(&args.registry_bootstrap)?;
+    let registry = spos_registry_script(&blueprint_json, &reg_tx_id, u64::from(reg_index))
+        .map_err(|e| format!("parameterize spos_registry: {e}"))?;
+    let treasury = treasury_info_script(&blueprint_json, &registry.hash)
+        .map_err(|e| format!("parameterize treasury_info: {e}"))?;
+
+    // ── identities: local secret keys, or the air-gapped halves ──
+    let cold_skey: Option<ed25519::SecretKey> = args
+        .cold_skey
+        .as_deref()
+        .map(|arg| parse_key32(arg, "--cold-skey").map(ed25519::SecretKey::from))
+        .transpose()?;
+    let cold_vkey: [u8; 32] = match (&cold_skey, args.cold_vkey.as_deref()) {
+        (Some(sk), None) => sk.public_key().into(),
+        (None, Some(vk)) => parse_hex_n(vk, "--cold-vkey")?,
+        (Some(sk), Some(vk)) => {
+            let derived: [u8; 32] = sk.public_key().into();
+            if parse_hex_n::<32>(vk, "--cold-vkey")? != derived {
+                return Err("--cold-vkey does not match --cold-skey".into());
+            }
+            derived
+        }
+        (None, None) => {
+            return Err(
+                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow"
+                    .into(),
+            );
+        }
+    };
+
+    let secp = Secp256k1::new();
+    let bifrost_keypair: Option<Keypair> = match args.bifrost_skey.as_deref() {
+        Some(arg) => Some(
+            Keypair::from_seckey_slice(&secp, &parse_key32(arg, "--bifrost-skey")?)
+                .map_err(|e| format!("--bifrost-skey: {e}"))?,
+        ),
+        None => None,
+    };
+    let bifrost_id_pk: [u8; 32] = match (&bifrost_keypair, args.bifrost_id_pk.as_deref()) {
+        (Some(kp), None) => kp.x_only_public_key().0.serialize(),
+        (None, Some(pk)) => parse_hex_n(pk, "--bifrost-id-pk")?,
+        (Some(kp), Some(pk)) => {
+            let derived = kp.x_only_public_key().0.serialize();
+            if parse_hex_n::<32>(pk, "--bifrost-id-pk")? != derived {
+                return Err("--bifrost-id-pk does not match --bifrost-skey".into());
+            }
+            derived
+        }
+        (None, None) => {
+            return Err(
+                "provide --bifrost-skey, or --bifrost-id-pk (+ --bifrost-sig) for the \
+                 air-gapped flow"
+                    .into(),
+            );
+        }
+    };
+
+    let pool_id = pool_id_from_cold_vkey(&cold_vkey);
+    let message = registration_message(&pool_id, &bifrost_id_pk, args.bifrost_url.as_bytes());
+    let digest = sha256::Hash::hash(&message).to_byte_array();
+
+    let cold_sig: [u8; 64] = match (&cold_skey, args.cold_sig.as_deref()) {
+        (Some(sk), _) => sk
+            .sign(&message)
+            .as_ref()
+            .try_into()
+            .expect("ed25519 signature is 64 bytes"),
+        (None, Some(sig)) => parse_hex_n(sig, "--cold-sig")?,
+        (None, None) => {
+            return Err(format!(
+                "no --cold-skey/--cold-sig. Air-gapped: Ed25519-sign this message with the \
+                 pool cold key and re-run with --cold-sig:\n  message (hex): {}",
+                hex::encode(&message)
+            ));
+        }
+    };
+    let bifrost_sig: [u8; 64] = match (&bifrost_keypair, args.bifrost_sig.as_deref()) {
+        (Some(kp), _) => secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), kp)
+            .serialize(),
+        (None, Some(sig)) => parse_hex_n(sig, "--bifrost-sig")?,
+        (None, None) => {
+            return Err(format!(
+                "no --bifrost-skey/--bifrost-sig. Air-gapped: BIP340-sign this 32-byte digest \
+                 with the bifrost identity key and re-run with --bifrost-sig:\n  \
+                 sha2_256(message): {}",
+                hex::encode(digest)
+            ));
+        }
+    };
+    let sigs = RegistrationSignatures {
+        cold_vkey,
+        cold_sig,
+        bifrost_sig,
+    };
+    verify_registration(&sigs, &bifrost_id_pk, args.bifrost_url.as_bytes())
+        .map_err(|e| format!("registration signatures: {e}"))?;
+
+    println!(
+        "pool id:           {} ({})",
+        hex::encode(pool_id),
+        pool_id_bech32(&pool_id)
+    );
+    println!("bifrost_id_pk:     {}", hex::encode(bifrost_id_pk));
+    println!("bifrost_url:       {}", args.bifrost_url);
+    println!("registry policy:   {}", registry.hash_hex());
+    println!("treasury policy:   {}", treasury.hash_hex());
+
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    // ── R2 min-stake gate: gates submission; a dry run only warns ──
+    match cfg.cardano.min_stake_lovelace {
+        Some(threshold) => {
+            let stake = rt
+                .block_on(fetch_pool_stake(&base_url, pid, &pool_id_bech32(&pool_id)))
+                .map_err(|e| format!("min-stake gate: {e}"))?;
+            let chk = check_min_stake(&stake, threshold);
+            println!(
+                "min-stake gate:    active_stake={} threshold={} → {}",
+                chk.active_stake,
+                chk.threshold,
+                if chk.meets { "PASS" } else { "FAIL" }
+            );
+            if !chk.meets {
+                if args.submit {
+                    return Err(
+                        "min-stake gate failed (R2) — refusing to submit register_spo".into(),
+                    );
+                }
+                eprintln!(
+                    "[register-spo] WARNING: min-stake gate failed; printing the dry-run tx, \
+                     but submission would be refused"
+                );
+            }
+        }
+        None => {
+            if args.submit {
+                return Err(
+                    "cardano.min_stake_lovelace is not configured — the R2 gate cannot run; \
+                     set it (the protocol min_stake) before submitting"
+                        .into(),
+                );
+            }
+            eprintln!(
+                "[register-spo] WARNING: cardano.min_stake_lovelace not configured; \
+                 dry run only — submission would be refused"
+            );
+        }
+    }
+
+    // ── chain state ──
+    let network = if wallet_addr.starts_with("addr_test") {
+        pallas_addresses::Network::Testnet
+    } else {
+        pallas_addresses::Network::Mainnet
+    };
+    let registry_addr = registry.enterprise_address(network);
+    let treasury_addr = treasury.enterprise_address(network);
+    let wallet_raw = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &wallet_addr))
+        .map_err(|e| format!("wallet UTxO query: {e}"))?;
+    let wallet_utxos: Vec<WalletUtxo> = wallet_raw.iter().map(WalletUtxo::from_bf).collect();
+    let registry_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &registry_addr))
+        .map_err(|e| format!("registry UTxO query: {e}"))?;
+    let treasury_utxos = rt
+        .block_on(bf_http::fetch_address_utxos(&base_url, pid, &treasury_addr))
+        .map_err(|e| format!("treasury UTxO query: {e}"))?;
+    let cost_models = rt
+        .block_on(bf_http::fetch_cost_models(&base_url, pid))
+        .map_err(|e| format!("fetch cost models: {e}"))?;
+    // Epoch-boundary validity window: the tx may not land in a later epoch
+    // than the one it was built (and its candidate snapshot computed) in.
+    let window = rt
+        .block_on(bf_http::fetch_epoch_window(&base_url, pid))
+        .map_err(|e| format!("epoch window: {e}"))?;
+    println!(
+        "validity window:   [{}, {}) — current epoch only",
+        window.current_slot, window.epoch_end_slot
+    );
+
+    let req = RegisterSpoRequest {
+        registry_script: &registry,
+        treasury_script: &treasury,
+        treasury_asset_name_hex: &args.treasury_nft_name,
+        registry_utxos: &registry_utxos,
+        treasury_utxos: &treasury_utxos,
+        wallet_address: &wallet_addr,
+        wallet_utxos: &wallet_utxos,
+        key: &key,
+        sigs: &sigs,
+        bifrost_id_pk,
+        bifrost_url: args.bifrost_url.as_bytes().to_vec(),
+        invalid_before: Some(window.current_slot),
+        invalid_hereafter: Some(window.epoch_end_slot),
+        cost_models: Some(cost_models),
+    };
+    let built = build_register_spo_tx(&req).map_err(|e| format!("build register_spo tx: {e}"))?;
+
+    let anchor = if built.anchor_asset_name == REGISTRATION_ROOT_KEY {
+        "reg-root (registry root)".to_string()
+    } else {
+        hex::encode(&built.anchor_asset_name)
+    };
+    println!("anchor element:    {anchor}");
+    println!(
+        "new identity root: {}",
+        hex::encode(built.new_bifrost_identity_root)
+    );
+    println!("membership token:  {}.{}", registry.hash_hex(), hex::encode(built.pool_id));
+    println!("signed tx hex:\n{}", built.signed_tx_hex);
+
+    if !args.submit {
+        println!("(dry run — pass --submit to broadcast via Blockfrost)");
+        return Ok(());
+    }
+    let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
     println!("submitted: tx_hash={tx_hash}");
     Ok(())
 }
@@ -1648,7 +2148,7 @@ fn run_proof_demo(min_signers: u16, max_signers: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cardano_outref;
+    use super::{parse_cardano_outref, parse_hex_n, parse_key32, pool_id_bech32};
 
     #[test]
     fn parse_cardano_outref_ok() {
@@ -1668,5 +2168,51 @@ mod tests {
         // non-numeric / out-of-u32-range index
         assert!(parse_cardano_outref(&format!("{}:x", "ab".repeat(32))).is_err());
         assert!(parse_cardano_outref(&format!("{}:4294967296", "ab".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn parse_hex_n_checks_length() {
+        assert_eq!(parse_hex_n::<2>("a1b2", "x").unwrap(), [0xa1, 0xb2]);
+        assert!(parse_hex_n::<2>("a1", "x").is_err());
+        assert!(parse_hex_n::<2>("zz", "x").is_err());
+    }
+
+    #[test]
+    fn parse_key32_accepts_hex_and_textenvelope() {
+        let hexkey = "11".repeat(32);
+        assert_eq!(parse_key32(&hexkey, "k").unwrap(), [0x11; 32]);
+
+        // cardano-cli TextEnvelope from a file.
+        let dir = std::env::temp_dir().join(format!("heimdall-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cold.skey");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type": "StakePoolSigningKey_ed25519", "description": "", "cborHex": "5820{}"}}"#,
+                "22".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_key32(path.to_str().unwrap(), "k").unwrap(),
+            [0x22; 32]
+        );
+        // TextEnvelope whose cborHex is not a 32-byte key
+        std::fs::write(&path, r#"{"type": "x", "cborHex": "5840aabb"}"#).unwrap();
+        assert!(parse_key32(path.to_str().unwrap(), "k").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The bech32 form must round-trip back to the same 28 bytes under the
+    // `pool` HRP (the id Blockfrost's /pools endpoint expects).
+    #[test]
+    fn pool_id_bech32_roundtrip() {
+        let id = [0x5Au8; 28];
+        let s = pool_id_bech32(&id);
+        assert!(s.starts_with("pool1"), "{s}");
+        let (hrp, data) = bitcoin::bech32::decode(&s).unwrap();
+        assert_eq!(hrp.as_str(), "pool");
+        assert_eq!(data, id);
     }
 }

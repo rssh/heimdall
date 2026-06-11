@@ -23,6 +23,7 @@ pub mod pegin_source;
 pub mod plutus;
 pub mod pegout_datum;
 pub mod publish;
+pub mod register_spo;
 pub mod registry;
 pub mod stake;
 pub mod treasury_bootstrap;
