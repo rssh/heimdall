@@ -80,6 +80,14 @@ pub trait CardanoChain: Send + Sync {
     /// Pending peg-out requests to fulfil.
     async fn query_pegout_requests(&self) -> EpochResult<Vec<PegOutRequestUtxo>>;
 
+    /// A pool's stake, for the off-chain min-stake gate (register_spo R2): the
+    /// contract can't read stake, so SPOs query it and require `active_stake >=
+    /// min_stake` before building register_spo and before admitting the SPO to
+    /// the DKG candidate set. `pool_id` is the bech32 pool id; see
+    /// [`crate::cardano::stake`] for the threshold check.
+    async fn query_pool_stake(&self, pool_id: &str)
+    -> EpochResult<crate::cardano::stake::PoolStake>;
+
     /// Publish the new FROST group key after DKG. The key becomes the
     /// internal key (Y_51) of the next treasury Taproot address.
     ///

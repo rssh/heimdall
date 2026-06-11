@@ -243,6 +243,18 @@ impl CardanoChain for MockCardanoChain {
         }
         Ok(())
     }
+
+    async fn query_pool_stake(
+        &self,
+        _pool_id: &str,
+    ) -> EpochResult<crate::cardano::stake::PoolStake> {
+        // Demo: a stake comfortably above any realistic threshold, so the mock
+        // roster always clears the min-stake gate.
+        Ok(crate::cardano::stake::PoolStake {
+            active_stake: 100_000_000_000_000,
+            live_stake: 100_000_000_000_000,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

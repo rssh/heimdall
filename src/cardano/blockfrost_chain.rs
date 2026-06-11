@@ -284,6 +284,15 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(vec![])
     }
 
+    async fn query_pool_stake(
+        &self,
+        pool_id: &str,
+    ) -> EpochResult<crate::cardano::stake::PoolStake> {
+        crate::cardano::stake::fetch_pool_stake(&self.bf_base_url, &self.bf_project_id, pool_id)
+            .await
+            .map_err(EpochError::Chain)
+    }
+
     async fn submit_signed_tm(&self, tx_bytes: &[u8]) -> EpochResult<()> {
         eprintln!(
             "[submit] signed BTC tx: {} bytes, hex: {}",

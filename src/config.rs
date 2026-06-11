@@ -140,6 +140,13 @@ pub struct CardanoConfig {
     pub treasury_policy_id: Option<String>,
     pub treasury_asset_name: Option<String>,
     pub mnemonic: Option<String>,
+    /// register_spo R2 min-stake threshold (lovelace). A registering pool's
+    /// `active_stake` must be `>=` this to build register_spo / join the DKG
+    /// candidate set. Canonically the on-chain `ConfigDatum.min_stake`; until
+    /// heimdall reads the Config UTxO (WI-009-adjacent) the operator sets it
+    /// here. `None` → no gate configured (the caller must error rather than
+    /// admit unconditionally).
+    pub min_stake_lovelace: Option<u64>,
     /// Whether to publish an oracle-update UTxO to Cardano after signing.
     /// Requires `blockfrost_project_id` and `mnemonic`. Default: true.
     pub submit_oracle: bool,
@@ -170,6 +177,7 @@ impl Default for CardanoConfig {
             treasury_policy_id: None,
             treasury_asset_name: None,
             mnemonic: None,
+            min_stake_lovelace: None,
             submit_oracle: true,
             oracle_constructor: 0,
             tm_script_cbor: None,

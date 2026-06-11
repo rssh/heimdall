@@ -24,6 +24,7 @@ pub mod plutus;
 pub mod pegout_datum;
 pub mod publish;
 pub mod registry;
+pub mod stake;
 pub mod treasury_bootstrap;
 pub mod treasury_datum;
 pub mod treasury_spend;
