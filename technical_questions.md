@@ -198,3 +198,45 @@ dust` (and realistically higher, since the spec already positions Bifrost for
 large liquidity moves, not retail-size withdrawals). **Question for
 FluidTokens:** add `min_peg_out_fbtc` to the Config and enforce it in
 `peg_out.ak` at lock time — folded into the §2 code-ward contract changes (b).
+
+## 3. Update-Y (key rotation): spec gap RESOLVED upstream; remaining gap is the contract
+
+History: our fork notes (2026-06, `internal-docs/bitfrost/heimdall/`
+`key-publication-todo.md`; fork commits `c84f8d3`/`4bc8b34`, since dropped)
+flagged Update-Y as a **spec gap** — the transaction existed by name only, with
+no Transaction-catalog entry and no authorization rule (no signature scheme,
+quorum, or validator check), and noted that a `treasury_movement.ak`-style
+leader-election gate would be unsafe here (the payload IS the new group key; a
+lone leader could publish an attacker key).
+
+**Resolved in the spec (upstream `main` @ `8b042f9`, 2026-06).**
+`technical_documentation.md` now:
+
+- lists **Update Y** in the Transaction catalog: "Publication of the new
+  roster's $Y_{51}$ to `treasury.ak`";
+- specifies the authorization in the group-key-generation steps: "The
+  **current roster** publishes the successfully derived group public key on
+  Cardano at `treasury.ak`, **authenticated by a FROST group signature from
+  the current roster**" — i.e. the outgoing roster signs the handoff, the
+  model our notes called candidate (a);
+- states in the Confirm-TM section that "key rotation is done in a separate
+  Update-Y transaction after DKG", cleanly separating it from TM confirmation.
+
+**Remaining gap is now CODE-ward.** The implemented `treasury.ak`
+(`treasury_info`) has no spend path that can rotate the key: its `spend`
+branch only authorizes a datum update when an `spos_registry`-policy token is
+minted, and every registry mint branch (`Register`/`Deregister`) requires the
+treasury transition to PRESERVE `current_spos_frost_key` (and address/outpoint;
+only `bifrost_identity_root` may change). So the spec's FROST-authenticated
+Update-Y is not expressible against the current contract. Note the check is
+implementable on-chain: the key to verify AGAINST (`current_spos_frost_key`)
+is already in the spent datum, so the validator can
+`verify_schnorr_signature(current_key, H(new datum fields), frost_sig)`.
+
+**Question for FluidTokens:** add an Update-Y redeemer/spend path to
+`treasury.ak` verifying a BIP340 signature by the datum's
+`current_spos_frost_key` over the new `(bifrost_identity_root,
+current_treasury_address, current_treasury_utxo_id, current_spos_frost_key)`
+— with replay protection (e.g. epoch binding or the spent outpoint in the
+signed message). Gates heimdall's K2 / `PublishKeys` (treasury handoff at
+epoch boundary); until then the group key set at K1 bootstrap is permanent.
