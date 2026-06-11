@@ -63,6 +63,21 @@ pub struct UnsignedTm {
     pub txid: Txid,
     pub prevouts: Vec<TxOut>,
     pub input_spend_info: Vec<TaprootSpendInfo>,
+    /// Peg-out requests dropped from this TM because they are unfulfillable on
+    /// Bitcoin (gross amount minus the per-pegout fee is below the dust
+    /// threshold — no valid BTC output can be produced). Surfaced so the
+    /// operator can see what was skipped; the user reclaims via `peg_out.ak`'s
+    /// Cancel path.
+    pub skipped_pegouts: Vec<SkippedPegOut>,
+}
+
+/// A peg-out request excluded from a TM as unfulfillable (see
+/// [`UnsignedTm::skipped_pegouts`]).
+#[derive(Debug, Clone)]
+pub struct SkippedPegOut {
+    pub script_pubkey: ScriptBuf,
+    /// The gross amount from the PegOut UTxO (before the per-pegout fee).
+    pub amount: Amount,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +87,6 @@ pub struct UnsignedTm {
 #[derive(Debug)]
 pub enum TmBuildError {
     InsufficientFunds { available: Amount, required: Amount },
-    NoPegOutAmountAfterFee { index: usize, amount: Amount, fee: Amount },
     DustOutput { index: usize, value: Amount },
     MalformedUnsignedTm { inputs: usize, prevouts: usize, spend_infos: usize },
 }
@@ -82,9 +96,6 @@ impl fmt::Display for TmBuildError {
         match self {
             Self::InsufficientFunds { available, required } => {
                 write!(f, "insufficient funds: have {available}, need {required}")
-            }
-            Self::NoPegOutAmountAfterFee { index, amount, fee } => {
-                write!(f, "peg-out [{index}] amount {amount} <= per-pegout fee {fee}")
             }
             Self::DustOutput { index, value } => {
                 write!(f, "output [{index}] value {value} below dust threshold")
@@ -169,16 +180,32 @@ pub fn build_tm(
     change_script_pubkey: ScriptBuf,
     fee_params: &FeeParams,
 ) -> Result<UnsignedTm, TmBuildError> {
-    // --- Validate peg-out amounts ---
-    for (i, po) in pegouts.iter().enumerate() {
-        if po.amount <= fee_params.per_pegout_fee {
-            return Err(TmBuildError::NoPegOutAmountAfterFee {
-                index: i,
+    // --- Drop unfulfillable peg-outs (skip, don't abort) ---
+    // A peg-out is payable iff its net (gross − per-pegout fee) is at least the
+    // dust threshold; below that, no valid BTC output exists. SKIP such requests
+    // rather than fail the whole TM — the peg-out address is permissionlessly
+    // payable, so one tiny/hostile peg-out must not block every peg-in and
+    // peg-out (bridge-wide liveness DoS). The user reclaims a sub-dust peg-out
+    // via `peg_out.ak`'s Cancel path.
+    //
+    // DETERMINISM: every SPO must skip the SAME set to build byte-identical TMs
+    // for FROST, so `per_pegout_fee` must be a consensus value — see WI-009 /
+    // technical_questions.md §2. (The proper long-term fix is the contract
+    // rejecting sub-min peg-outs at lock time via a config min-fbtc value.)
+    let mut skipped_pegouts = Vec::new();
+    pegouts.retain(|po| {
+        let payable = matches!(
+            po.amount.checked_sub(fee_params.per_pegout_fee),
+            Some(net) if net >= DUST_THRESHOLD
+        );
+        if !payable {
+            skipped_pegouts.push(SkippedPegOut {
+                script_pubkey: po.script_pubkey.clone(),
                 amount: po.amount,
-                fee: fee_params.per_pegout_fee,
             });
         }
-    }
+        payable
+    });
 
     // --- Sort peg-in inputs lexicographically by (txid || vout_le) ---
     pegins.sort_by(|a, b| outpoint_sort_key(&a.outpoint).cmp(&outpoint_sort_key(&b.outpoint)));
@@ -232,17 +259,12 @@ pub fn build_tm(
     let mut total_pegout = Amount::ZERO;
     let mut pegout_outputs = Vec::with_capacity(num_pegout_outputs);
 
-    for (i, po) in pegouts.iter().enumerate() {
+    for po in pegouts.iter() {
+        // `retain` above guarantees net >= DUST_THRESHOLD for every remaining peg-out.
         let net_amount = po
             .amount
             .checked_sub(fee_params.per_pegout_fee)
-            .expect("checked above");
-        if net_amount < DUST_THRESHOLD {
-            return Err(TmBuildError::DustOutput {
-                index: i + 1, // +1 because output 0 is change
-                value: net_amount,
-            });
-        }
+            .expect("retained => amount > fee");
         total_pegout = total_pegout.checked_add(net_amount).expect("no overflow");
         pegout_outputs.push(TxOut {
             value: net_amount,
@@ -298,6 +320,7 @@ pub fn build_tm(
         txid,
         prevouts,
         input_spend_info,
+        skipped_pegouts,
     })
 }
 
@@ -623,6 +646,57 @@ mod tests {
             tm.tx.output[1].value.to_sat(),
             requested - fee_params.per_pegout_fee.to_sat()
         );
+    }
+
+    // Unfulfillable peg-outs (amount <= fee, or net below dust) are SKIPPED, not
+    // fatal: the TM still builds and pays the fulfillable ones. One tiny/hostile
+    // peg-out must not block the whole sweep.
+    #[test]
+    fn test_subdust_pegouts_are_skipped_not_fatal() {
+        let fee_params = default_fee_params(); // per_pegout_fee = 1000, dust = 330
+        let change = change_address();
+
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![
+                make_pegout(0x10, 100_000), // payable
+                make_pegout(0x11, 500),     // amount < fee -> skip
+                make_pegout(0x12, 1_200),   // net 200 < dust -> skip
+            ],
+            change,
+            &fee_params,
+        )
+        .unwrap();
+
+        // Only the payable peg-out is paid (output[0] is change).
+        assert_eq!(tm.tx.output.len(), 2);
+        assert_eq!(
+            tm.tx.output[1].value.to_sat(),
+            100_000 - fee_params.per_pegout_fee.to_sat()
+        );
+        // The two unfulfillable ones are reported as skipped, with gross amounts.
+        assert_eq!(tm.skipped_pegouts.len(), 2);
+        let mut skipped: Vec<u64> = tm.skipped_pegouts.iter().map(|s| s.amount.to_sat()).collect();
+        skipped.sort_unstable();
+        assert_eq!(skipped, vec![500, 1_200]);
+    }
+
+    // A TM built entirely of unfulfillable peg-outs still succeeds (no payments,
+    // all skipped) rather than aborting.
+    #[test]
+    fn test_all_pegouts_skipped_still_builds() {
+        let fee_params = default_fee_params();
+        let tm = build_tm(
+            make_treasury_input(0xAA, 10_000_000),
+            vec![],
+            vec![make_pegout(0x11, 500), make_pegout(0x12, 900)],
+            change_address(),
+            &fee_params,
+        )
+        .unwrap();
+        assert_eq!(tm.tx.output.len(), 1); // change only
+        assert_eq!(tm.skipped_pegouts.len(), 2);
     }
 
     #[test]

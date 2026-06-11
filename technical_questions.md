@@ -144,8 +144,8 @@ this decision implies:
   `fee_rate_sat_per_vb` + the per-peg-out fee; define the governance update
   mechanism; resolve gross-vs-net (2a); state the per-peg-out fee value and
   whether fees are exact or leader-bounded (see the signing-model note below).
-- **(b) Contract** — add the fee fields to `ConfigDatum`
-  (`lib/bifrost/types/config.ak`).
+- **(b) Contract** — add the fee fields **and a minimum peg-out fBTC value** to
+  `ConfigDatum` (`lib/bifrost/types/config.ak`); see 2d.
 - **(c) Contract** — change `config.ak` `spend` from `False` to a
   governance-authorized update path so the Config UTxO is actually updatable.
 - **(d) Contract** — implement the
@@ -167,3 +167,26 @@ peg-out destinations/amounts at gross − fee, treasury next-address, and that
 the fee is within bounds). (B) handles real-time Bitcoin fee movement better. A
 governance-updatable Config UTxO (c) supports either. To be decided with the
 spec elaboration (a).
+
+### 2d. Minimum peg-out fBTC value belongs in the Config (not just off-chain skip)
+
+A peg-out whose locked fBTC is below `per_peg_out_fee + Bitcoin dust (330 sat)`
+is **physically unfulfillable** — no valid BTC output can be produced — so the
+TM builder must drop it. heimdall now does this defensively off-chain
+(`build_tm` skips such peg-outs and reports them in `UnsignedTm.skipped_pegouts`
+instead of aborting the whole TM; without it, anyone could park 1 sat of fBTC at
+the permissionlessly-payable `peg_out.ak` address and DoS every Treasury
+Movement bridge-wide). But the off-chain skip is a liveness band-aid: it leaves
+the unfulfillable PegOut UTxO on-chain (the user must Cancel to reclaim), and
+the skip threshold is only deterministic across SPOs if `per_peg_out_fee` is a
+consensus value (2b).
+
+The proper fix is on-chain: **add a `min_peg_out_fbtc` value to `ConfigDatum`
+and have `peg_out.ak` reject a lock whose fBTC value is below it.** Then
+sub-dust peg-outs cannot be created in the first place, the griefing vector is
+closed at the source, and the off-chain skip becomes a belt-and-suspenders
+guard rather than the only defense. The minimum must be ≥ `per_peg_out_fee +
+dust` (and realistically higher, since the spec already positions Bifrost for
+large liquidity moves, not retail-size withdrawals). **Question for
+FluidTokens:** add `min_peg_out_fbtc` to the Config and enforce it in
+`peg_out.ak` at lock time — folded into the §2 code-ward contract changes (b).

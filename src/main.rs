@@ -1086,6 +1086,16 @@ fn run_sweep_pegins(
     )
     .map_err(|e| format!("build sweep: {e}"))?;
 
+    // Surface any peg-outs dropped as unfulfillable (sub-dust after the fee) so
+    // the operator sees them — the TM still pays the rest rather than aborting.
+    for s in &unsigned.skipped_pegouts {
+        eprintln!(
+            "[sweep] skipped unfulfillable peg-out → {} ({} sat, below dust after fee)",
+            hex::encode(s.script_pubkey.as_bytes()),
+            s.amount.to_sat()
+        );
+    }
+
     // output[0] is the new treasury; if it doesn't carry the treasury
     // scriptPubKey the whole balance would move to the wrong address, so
     // refuse before signing rather than broadcast a misdirected sweep.
