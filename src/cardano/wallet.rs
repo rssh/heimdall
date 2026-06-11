@@ -8,8 +8,9 @@
 //! wallets.
 
 use pallas_addresses::{Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart};
-use pallas_crypto::hash::Hasher;
 use pallas_wallet::{hd::Bip32PrivateKey, PrivateKey};
+
+use crate::cardano::hash::blake2b_224;
 
 /// CIP-1852 hardened offset: `n'` = `0x8000_0000 | n`.
 const HARDENED: u32 = 0x8000_0000;
@@ -55,10 +56,10 @@ pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
         .to_ed25519_private_key();
 
     let pay_pk: [u8; 32] = payment_key.public_key().into();
-    let pkh: [u8; 28] = (*Hasher::<224>::hash(&pay_pk)).into();
+    let pkh = blake2b_224(&pay_pk);
 
     let stk_pk: [u8; 32] = staking_key.public_key().into();
-    let skh: [u8; 28] = (*Hasher::<224>::hash(&stk_pk)).into();
+    let skh = blake2b_224(&stk_pk);
 
     let shelley = ShelleyAddress::new(
         Network::Testnet,
@@ -75,8 +76,7 @@ pub fn wallet_address_from_mnemonic(mnemonic: &str) -> Result<String, String> {
 /// available.
 pub fn wallet_address(key: &PrivateKey) -> String {
     let pk_bytes: [u8; 32] = key.public_key().into();
-    let hash = Hasher::<224>::hash(&pk_bytes);
-    let pkh: [u8; 28] = (*hash).into();
+    let pkh = blake2b_224(&pk_bytes);
     let shelley = ShelleyAddress::new(
         Network::Testnet,
         ShelleyPaymentPart::key_hash(pkh.into()),
@@ -91,9 +91,7 @@ pub fn wallet_address(key: &PrivateKey) -> String {
 /// `required_signers` in the tx body.
 pub fn pub_key_hash_hex(key: &PrivateKey) -> String {
     let pk_bytes: [u8; 32] = key.public_key().into();
-    let hash = Hasher::<224>::hash(&pk_bytes);
-    let pkh: [u8; 28] = (*hash).into();
-    hex::encode(pkh)
+    hex::encode(blake2b_224(&pk_bytes))
 }
 
 #[cfg(test)]

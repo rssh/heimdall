@@ -308,7 +308,7 @@ mod tests {
     // roots (the on-chain registry validator does exactly this check).
     #[test]
     fn apply_registration_updates_root_and_yields_valid_proof() {
-        let trie = mpf::Trie::from_pairs(&pairs(30)).unwrap();
+        let trie = mpf::Trie::from_pairs(pairs(30)).unwrap();
         let current = sample_datum(trie.root_hash());
 
         let pk = b"new-bifrost-id-pk";
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn apply_registration_rejects_stale_trie_and_present_key() {
-        let trie = mpf::Trie::from_pairs(&pairs(10)).unwrap();
+        let trie = mpf::Trie::from_pairs(pairs(10)).unwrap();
         // datum root disagrees with the trie → RootMismatch.
         let stale = sample_datum([9u8; 32]);
         assert!(matches!(
@@ -359,7 +359,7 @@ mod tests {
     // The encoded proof is a CBOR-roundtrippable List<ProofStep> of the right length.
     #[test]
     fn proof_encodes_to_plutus_list() {
-        let trie = mpf::Trie::from_pairs(&pairs(30)).unwrap();
+        let trie = mpf::Trie::from_pairs(pairs(30)).unwrap();
         let proof = trie.prove_non_membership(b"absent-key").unwrap();
         let pd = proof_to_plutus_data(&proof);
 

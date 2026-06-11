@@ -15,12 +15,12 @@
 //! computes/verifies roots from a given proof and is validated below against the library's
 //! own block-845602 test vector, so our hashing matches the on-chain validator exactly.
 //!
-//! ## Phase 2 (TODO, WI-001): off-chain trie + proof generation
+//! ## Phase 2: off-chain trie + proof generation
 //!
-//! The part `register_spo` actually calls — maintain the full key/value trie and *generate*
-//! inclusion/exclusion proofs (`Branch`/`Fork`/`Leaf` steps + neighbors). Not in the Aiken
-//! on-chain lib; reference the `aiken-lang/merkle-patricia-forestry` `off-chain` (TS) package
-//! or the scalus `AikenMpfData` port.
+//! The part `register_spo` actually calls — maintain the full key/value trie ([`Trie`]:
+//! insert / delete / get) and *generate* inclusion/exclusion proofs (`Branch`/`Fork`/`Leaf`
+//! steps + neighbors). Not in the Aiken on-chain lib; ported from the scalus off-chain
+//! `MerklePatriciaForestry` and validated end-to-end against the Phase 1 verifier.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -39,11 +39,9 @@ const DIGEST: usize = 32;
 // hashing (helpers.ak)
 // ---------------------------------------------------------------------------
 
-/// blake2b-256 of `data`.
-#[must_use]
-pub fn blake2b_256(data: &[u8]) -> Hash {
-    (*Hasher::<256>::hash(data)).into()
-}
+// One-shot digests live in the shared `cardano::hash` module (WI-007 P10);
+// `combine` stays here because it feeds two slices incrementally.
+pub use crate::cardano::hash::blake2b_256;
 
 /// `combine(l, r) = blake2b_256(l ‖ r)`.
 #[must_use]
@@ -478,9 +476,12 @@ fn do_fork(
 // untrusted proof up front (`validate_proof`) and returns `Result` instead of
 // panicking; `do_insert` returns `Err(KeyPresent)` on a duplicate key; node
 // hashes are memoised (`OnceLock`) and children are `Arc`-shared so an insert
-// clones cheap pointers rather than deep-copying subtrees. Still deferred
-// (WI-007): `do_delete` (deregister), fixed-size proof types, and an iterator
-// `from_pairs`.
+// clones cheap pointers rather than deep-copying subtrees; `do_delete` (with
+// branch collapse) supports deregister_spo; `from_pairs` streams from any pair
+// iterator. Fixed-size proof types (P8) are deliberately NOT adopted:
+// `validate_proof` already rejects every malformed length/range up front, and
+// the `Vec` fields keep `ProofStep` directly constructible from decoded
+// Plutus data — revisit only if a second verifier consumer appears.
 // ===========================================================================
 
 /// blake2b-256 of a key/value yields a 32-byte path → 64 nibbles deep.
@@ -720,6 +721,74 @@ fn do_insert(node: &Node, path: &[u8], cursor: usize, value: &[u8]) -> Result<Ar
     }
 }
 
+/// Remove the leaf at `path`, collapsing a branch left with a single child
+/// (scalus `doDelete`): a lone leaf re-roots its suffix at this branch's
+/// cursor; a lone inner branch absorbs this branch's prefix plus the
+/// connecting nibble.
+fn do_delete(node: &Node, path: &[u8], cursor: usize) -> Result<Arc<Node>, MpfError> {
+    match node {
+        Node::Empty => Err(MpfError::KeyAbsent),
+
+        Node::Leaf { full_path, .. } => {
+            if full_path.as_slice() == path {
+                Ok(Arc::new(Node::Empty))
+            } else {
+                Err(MpfError::KeyAbsent)
+            }
+        }
+
+        Node::Branch {
+            skip_start,
+            skip_len,
+            rep_path,
+            children,
+            size,
+            ..
+        } => {
+            if !branch_skip_matches_path(rep_path, *skip_len, path, cursor) {
+                return Err(MpfError::KeyAbsent);
+            }
+            let child_nibble = nibble(path, cursor + skip_len) as usize;
+            let new_child = do_delete(&children[child_nibble], path, cursor + skip_len + 1)?;
+            let mut new_children = children.clone();
+            new_children[child_nibble] = new_child;
+
+            let mut non_empty = (0..16).filter(|&i| !matches!(*new_children[i], Node::Empty));
+            let (first, second) = (non_empty.next(), non_empty.next());
+            match (first, second) {
+                // A branch always splits >= 2 descendants, and we removed at
+                // most one leaf below — at least one child remains.
+                (Some(only), None) => match &*new_children[only] {
+                    Node::Leaf {
+                        full_path, value, ..
+                    } => Ok(Node::leaf(cursor, full_path.clone(), value.clone())),
+                    Node::Branch {
+                        skip_len: inner_len,
+                        rep_path: inner_rep,
+                        children: inner_children,
+                        size: inner_size,
+                        ..
+                    } => Ok(Node::branch(
+                        cursor,
+                        skip_len + 1 + inner_len,
+                        inner_rep.clone(),
+                        inner_children.clone(),
+                        *inner_size,
+                    )),
+                    Node::Empty => unreachable!("filtered out above"),
+                },
+                _ => Ok(Node::branch(
+                    *skip_start,
+                    *skip_len,
+                    rep_path.clone(),
+                    new_children,
+                    size - 1,
+                )),
+            }
+        }
+    }
+}
+
 fn do_get(node: &Node, path: &[u8], cursor: usize) -> Option<Vec<u8>> {
     match node {
         Node::Empty => None,
@@ -831,11 +900,19 @@ impl Trie {
         }
     }
 
-    /// Build a trie from `(key, value)` pairs. Returns `Err(KeyPresent)` on a duplicate key.
-    pub fn from_pairs(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Self, MpfError> {
+    /// Build a trie from `(key, value)` pairs. Returns `Err(KeyPresent)` on a
+    /// duplicate key. Accepts any pair iterator, so callers can stream straight
+    /// from their source (e.g. a roster `BTreeMap`) without collecting owned
+    /// `Vec`s first.
+    pub fn from_pairs<I, K, V>(entries: I) -> Result<Self, MpfError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
         let mut t = Trie::empty();
         for (k, v) in entries {
-            t = t.insert(k, v)?;
+            t = t.insert(k.as_ref(), v.as_ref())?;
         }
         Ok(t)
     }
@@ -866,6 +943,19 @@ impl Trie {
         let path = blake2b_256(key);
         Ok(Trie {
             root: do_insert(&self.root, &path, 0, value)?,
+        })
+    }
+
+    /// Remove `key`. Returns `Err(KeyAbsent)` if it is not present.
+    ///
+    /// For deregister_spo / SPO Exit: the on-chain `mpf.delete(old_root, key,
+    /// value, proof)` consumes a MEMBERSHIP proof generated against the
+    /// PRE-delete trie (`prove_membership(key)`) — `including` rebuilds the
+    /// old root, `excluding` the post-delete root this method computes.
+    pub fn delete(&self, key: &[u8]) -> Result<Trie, MpfError> {
+        let path = blake2b_256(key);
+        Ok(Trie {
+            root: do_delete(&self.root, &path, 0)?,
         })
     }
 
@@ -1097,7 +1187,7 @@ mod tests {
     #[test]
     fn trie_membership_proofs_verify_for_all_keys() {
         let pairs = sample_pairs(30);
-        let t = Trie::from_pairs(&pairs).unwrap();
+        let t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
         assert_eq!(t.len(), 30);
         assert_eq!(t.get(b"spo-7"), Some(b"pool-7".to_vec()));
         for (k, v) in &pairs {
@@ -1114,7 +1204,7 @@ mod tests {
     // (with the real value) the post-insert root — exactly the register_spo flow.
     #[test]
     fn trie_non_membership_proof_round_trips() {
-        let t = Trie::from_pairs(&sample_pairs(30)).unwrap();
+        let t = Trie::from_pairs(sample_pairs(30)).unwrap();
         let key = b"spo-new";
         let value = b"pool-new";
         assert!(t.get(key).is_none());
@@ -1130,7 +1220,7 @@ mod tests {
 
     #[test]
     fn trie_prove_error_cases() {
-        let t = Trie::from_pairs(&sample_pairs(5)).unwrap();
+        let t = Trie::from_pairs(sample_pairs(5)).unwrap();
         assert_eq!(t.prove_membership(b"spo-absent"), Err(MpfError::KeyAbsent));
         assert_eq!(t.prove_non_membership(b"spo-0"), Err(MpfError::KeyPresent));
     }
@@ -1142,7 +1232,7 @@ mod tests {
     #[test]
     fn trie_large_trie_exercises_fork_steps() {
         let pairs = sample_pairs(200);
-        let t = Trie::from_pairs(&pairs).unwrap();
+        let t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
         assert_eq!(t.len(), 200);
         let mut fork_seen = false;
         for (k, v) in &pairs {
@@ -1214,13 +1304,13 @@ mod tests {
             (b"a".to_vec(), b"1".to_vec()),
             (b"a".to_vec(), b"2".to_vec()),
         ];
-        assert!(matches!(Trie::from_pairs(&dup), Err(MpfError::KeyPresent)));
+        assert!(matches!(Trie::from_pairs(dup), Err(MpfError::KeyPresent)));
     }
 
     // The verify_* helpers do the root comparison for the caller.
     #[test]
     fn verify_helpers_compare_against_expected_root() {
-        let t = Trie::from_pairs(&sample_pairs(30)).unwrap();
+        let t = Trie::from_pairs(sample_pairs(30)).unwrap();
         let key = b"spo-new";
         let proof = t.prove_non_membership(key).unwrap();
         // Exclusion against the real root succeeds; against a wrong root, RootMismatch.
@@ -1240,5 +1330,99 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Trie>();
         assert_send_sync::<MpfError>();
+    }
+
+    // ----- WI-007 H2: delete + branch collapse -----
+
+    // Deleting any key must yield a trie structurally identical to one built
+    // without it — the strongest collapse check: every leaf/branch absorption
+    // must land on exactly the canonical shape (and thus the canonical root).
+    #[test]
+    fn delete_matches_trie_built_without_the_key() {
+        let pairs = sample_pairs(30);
+        let t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        for (k, _) in &pairs {
+            let deleted = t.delete(k).expect("key present");
+            let rebuilt = Trie::from_pairs(
+                pairs.iter().filter(|(pk, _)| pk != k).map(|(k, v)| (k, v)),
+            )
+            .unwrap();
+            assert_eq!(
+                deleted.root_hash(),
+                rebuilt.root_hash(),
+                "delete({k:?}) must equal the trie built without it"
+            );
+            assert_eq!(deleted.len(), 29);
+            assert_eq!(deleted.get(k), None);
+        }
+    }
+
+    // Deep sweep: drain half of a 200-key trie one delete at a time, checking
+    // the root against a freshly-built trie at every step — exercises leaf and
+    // inner-branch collapse (prefix merge) across many shapes.
+    #[test]
+    fn delete_sweep_collapses_branches_correctly() {
+        let pairs = sample_pairs(200);
+        let mut t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        for (k, _) in &pairs[..100] {
+            t = t.delete(k).unwrap();
+        }
+        let rebuilt = Trie::from_pairs(pairs[100..].iter().map(|(k, v)| (k, v))).unwrap();
+        assert_eq!(t.root_hash(), rebuilt.root_hash());
+        assert_eq!(t.len(), 100);
+        // The drained trie still proves membership for the remaining keys.
+        for (k, v) in &pairs[100..] {
+            let proof = t.prove_membership(k).unwrap();
+            assert_eq!(including(k, v, &proof).unwrap(), t.root_hash());
+        }
+    }
+
+    // The deregister_spo flow: the removal proof is a MEMBERSHIP proof against
+    // the PRE-delete trie — `including` rebuilds the old root (what on-chain
+    // `mpf.delete` checks) and `excluding` the post-delete root (what it
+    // returns).
+    #[test]
+    fn delete_removal_proof_round_trips() {
+        let pairs = sample_pairs(30);
+        let t = Trie::from_pairs(pairs.iter().map(|(k, v)| (k, v))).unwrap();
+        let (key, value) = &pairs[7];
+
+        let removal_proof = t.prove_membership(key).unwrap();
+        assert_eq!(
+            including(key, value, &removal_proof).unwrap(),
+            t.root_hash(),
+            "inclusion == pre-delete root"
+        );
+        assert_eq!(
+            excluding(key, &removal_proof).unwrap(),
+            t.delete(key).unwrap().root_hash(),
+            "exclusion == post-delete root"
+        );
+    }
+
+    #[test]
+    fn delete_edge_cases() {
+        // Deleting an absent key (empty trie, wrong leaf, diverging branch).
+        assert!(matches!(
+            Trie::empty().delete(b"k"),
+            Err(MpfError::KeyAbsent)
+        ));
+        let t = Trie::empty().insert(b"k", b"v").unwrap();
+        assert!(matches!(t.delete(b"other"), Err(MpfError::KeyAbsent)));
+        let t30 = Trie::from_pairs(sample_pairs(30)).unwrap();
+        assert!(matches!(
+            t30.delete(b"spo-absent"),
+            Err(MpfError::KeyAbsent)
+        ));
+
+        // Deleting the last element yields the empty trie (NULL_HASH root).
+        let emptied = t.delete(b"k").unwrap();
+        assert!(emptied.is_empty());
+        assert_eq!(emptied.root_hash(), NULL_HASH);
+
+        // delete → re-insert restores the exact root.
+        let r0 = t30.root_hash();
+        let restored = t30.delete(b"spo-3").unwrap().insert(b"spo-3", b"pool-3").unwrap();
+        assert_eq!(restored.root_hash(), r0);
     }
 }

@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn registration_transition_flows_into_the_leg() {
         let script = test_script();
-        let trie = mpf::Trie::from_pairs(&[
+        let trie = mpf::Trie::from_pairs([
             (b"spo-a".to_vec(), b"pool-a".to_vec()),
             (b"spo-b".to_vec(), b"pool-b".to_vec()),
         ])

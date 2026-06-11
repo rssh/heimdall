@@ -47,7 +47,6 @@ use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::{Keypair, Message, XOnlyPublicKey, schnorr};
 use pallas_codec::minicbor;
 use pallas_codec::utils::{Bytes, NonEmptySet};
-use pallas_crypto::hash::Hasher;
 use pallas_crypto::key::ed25519;
 use pallas_primitives::PlutusData;
 use pallas_primitives::conway::{Tx, VKeyWitness};
@@ -139,7 +138,7 @@ impl From<TreasuryInfoError> for RegisterSpoError {
 /// token name and the new node's key, all in one.
 #[must_use]
 pub fn pool_id_from_cold_vkey(cold_vkey: &[u8; 32]) -> [u8; 28] {
-    *Hasher::<224>::hash(cold_vkey)
+    crate::cardano::hash::blake2b_224(cold_vkey)
 }
 
 /// `registration_message` in `spos_registry.ak`:
@@ -525,7 +524,7 @@ pub fn build_register_spo_tx(req: &RegisterSpoRequest) -> Result<RegisterSpoTx, 
     // Treasury leg: rebuild the identity trie from the (pre-insert) list and
     // derive the post-registration datum + absence proof.
     let identity_trie =
-        mpf::Trie::from_pairs(&list.identity_pairs()).map_err(TreasuryInfoError::Mpf)?;
+        mpf::Trie::from_pairs(list.identity_pairs()).map_err(TreasuryInfoError::Mpf)?;
     let state = find_treasury_state(
         req.treasury_utxos,
         &req.treasury_script.hash_hex(),
@@ -1176,7 +1175,7 @@ mod tests {
         let registry = registry_script();
         let treasury = treasury_script(&registry.hash);
 
-        let trie = mpf::Trie::from_pairs(identity_pairs).unwrap();
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
         let treasury_datum = TreasuryInfoDatum {
             bifrost_identity_root: trie.root_hash(),
             current_treasury_address: b"\x51\x20treasury-spk".to_vec(),
@@ -1438,7 +1437,7 @@ mod tests {
 
         // The treasury root advanced exactly as the on-chain mpf.insert will
         // recompute it from the (non-empty) absence proof.
-        let trie = mpf::Trie::from_pairs(&identity_pairs).unwrap();
+        let trie = mpf::Trie::from_pairs(identity_pairs.iter().map(|(k, v)| (k, v))).unwrap();
         let expected = trie.insert(&bifrost_pk(), &pool_id).unwrap().root_hash();
         assert_eq!(built.new_bifrost_identity_root, expected);
     }
