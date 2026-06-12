@@ -6,10 +6,10 @@ use frost_secp256k1_tr::Identifier;
 
 use heimdall::cardano::blockfrost_chain::BlockfrostCardanoChain;
 use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
-use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::cardano::mock::MockCardanoPegInSource;
 use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
 use heimdall::cardano::pegin_source::CardanoPegInSource;
+use heimdall::cardano::treasury_datum::TreasuryConfig;
 use heimdall::config::HeimdallConfig;
 use heimdall::epoch::mocks::{MockCardanoChain, OsRngSource, SeededRngSource, SystemClock};
 use heimdall::epoch::run_epoch_loop;
@@ -387,9 +387,15 @@ fn main() {
             let mut cfg = load_config(config.as_deref());
 
             // CLI flags override TOML values.
-            if let Some(v) = min_signers { cfg.demo.min_signers = v; }
-            if let Some(v) = max_signers { cfg.demo.max_signers = v; }
-            if let Some(v) = base_port { cfg.http.base_port = v; }
+            if let Some(v) = min_signers {
+                cfg.demo.min_signers = v;
+            }
+            if let Some(v) = max_signers {
+                cfg.demo.max_signers = v;
+            }
+            if let Some(v) = base_port {
+                cfg.http.base_port = v;
+            }
             if let Some(ref v) = blockfrost_project_id {
                 cfg.cardano.blockfrost_project_id = Some(v.clone());
             }
@@ -534,8 +540,7 @@ fn main() {
             submit,
         } => {
             let cfg = load_config(config.as_deref());
-            if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit)
-            {
+            if let Err(e) = run_deploy_registry_ref(&cfg, &blueprint, &registry_bootstrap, submit) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -651,21 +656,9 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     // until the on-chain SPO registry is wired.
     let fixture = heimdall::epoch::fixture::demo_static_fixture_from_config(&cfg);
 
-    let script_address: String = cfg
-        .cardano
-        .pegin_script_address
-        .clone()
-        .unwrap_or_default();
-    let treasury_address: String = cfg
-        .cardano
-        .treasury_address
-        .clone()
-        .unwrap_or_default();
-    let treasury_policy_id: String = cfg
-        .cardano
-        .treasury_policy_id
-        .clone()
-        .unwrap_or_default();
+    let script_address: String = cfg.cardano.pegin_script_address.clone().unwrap_or_default();
+    let treasury_address: String = cfg.cardano.treasury_address.clone().unwrap_or_default();
+    let treasury_policy_id: String = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
     let treasury_asset_name_hex: String = cfg
         .cardano
         .treasury_asset_name
@@ -766,10 +759,7 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
         Arc::new(OsRngSource)
     };
 
-    let roster = chain
-        .query_roster(0)
-        .await
-        .expect("query initial roster");
+    let roster = chain.query_roster(0).await.expect("query initial roster");
     let me = roster
         .participants
         .get(&id)
@@ -812,7 +802,13 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
     println!("\n── Bitcoin Treasury Movement ──");
     println!("  txid:    {}", tm.txid);
     println!("  inputs:  {}", tm.unsigned_tx.input.len());
-    for (i, (inp, prevout)) in tm.unsigned_tx.input.iter().zip(tm.prevouts.iter()).enumerate() {
+    for (i, (inp, prevout)) in tm
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(tm.prevouts.iter())
+        .enumerate()
+    {
         println!(
             "    [{}] {}:{} — {} sat  script={}",
             i,
@@ -859,13 +855,14 @@ fn mock_chain_with_rpc(
 }
 
 /// The local HTTP bind port, from this node's OWN registered bifrost_url.
-/// Requires an explicit trailing `:<port>` — peers fetching FROM a URL can
-/// rely on scheme defaults, but the node cannot guess which local port to
-/// serve on.
+/// Parses the URL properly (a naive `rsplit(':')` mishandles paths, IPv6
+/// hosts, and userinfo that the roster's URL validation accepts) and
+/// requires an explicit `:<port>` — peers fetching FROM a URL can rely on
+/// scheme defaults, but the node cannot guess which local port to serve on.
 fn port_from_url(url: &str) -> Result<u16, String> {
-    url.rsplit(':')
-        .next()
-        .and_then(|s| s.parse().ok())
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.port())
         .ok_or_else(|| {
             format!(
                 "this node's bifrost_url {url:?} has no explicit ':<port>' — the demo binds its \
@@ -880,13 +877,19 @@ fn port_from_url(url: &str) -> Result<u16, String> {
 fn y_fed_keypair(
     secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
     cfg: &HeimdallConfig,
-) -> Result<(bitcoin::secp256k1::SecretKey, bitcoin::key::UntweakedPublicKey), String> {
+) -> Result<
+    (
+        bitcoin::secp256k1::SecretKey,
+        bitcoin::key::UntweakedPublicKey,
+    ),
+    String,
+> {
     let seed: [u8; 32] = hex::decode(&cfg.bitcoin.y_fed_seed_hex)
         .map_err(|e| format!("y_fed_seed_hex: {e}"))?
         .try_into()
         .map_err(|_| "y_fed_seed_hex must be 32 bytes".to_string())?;
-    let sk = bitcoin::secp256k1::SecretKey::from_slice(&seed)
-        .map_err(|e| format!("seed -> sk: {e}"))?;
+    let sk =
+        bitcoin::secp256k1::SecretKey::from_slice(&seed).map_err(|e| format!("seed -> sk: {e}"))?;
     let y_fed = sk.x_only_public_key(secp).0;
     Ok((sk, y_fed))
 }
@@ -921,7 +924,9 @@ fn fee_params_from_cfg(cfg: &HeimdallConfig) -> heimdall::bitcoin::tm_builder::F
 }
 
 /// Build the Bitcoin RPC config; errors if `bitcoin.rpc_url` is unset.
-fn btc_rpc_config(cfg: &HeimdallConfig) -> Result<heimdall::cardano::btc_rpc::BtcRpcConfig, String> {
+fn btc_rpc_config(
+    cfg: &HeimdallConfig,
+) -> Result<heimdall::cardano::btc_rpc::BtcRpcConfig, String> {
     let url = cfg
         .bitcoin
         .rpc_url
@@ -946,7 +951,7 @@ fn run_treasury_self_send(
     use bitcoin::key::Secp256k1;
     use bitcoin::{Amount, ScriptBuf};
     use heimdall::bitcoin::taproot::treasury_spend_info;
-    use heimdall::bitcoin::tm_builder::{build_tm, sign_tm_single_key, TreasuryInput};
+    use heimdall::bitcoin::tm_builder::{TreasuryInput, build_tm, sign_tm_single_key};
     use heimdall::cardano::btc_rpc::broadcast_btc_tx;
 
     let secp = Secp256k1::new();
@@ -971,12 +976,15 @@ fn run_treasury_self_send(
     )
     .map_err(|e| format!("build self-send: {e}"))?;
 
-    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
-        .map_err(|e| format!("sign self-send: {e}"))?;
+    let signed =
+        sign_tm_single_key(&secp, &unsigned, &sk).map_err(|e| format!("sign self-send: {e}"))?;
     let raw = bitcoin::consensus::encode::serialize(&signed);
 
     println!("self-send txid : {}", signed.compute_txid());
-    println!("output[0]      : {} sat (treasury)", signed.output[0].value.to_sat());
+    println!(
+        "output[0]      : {} sat (treasury)",
+        signed.output[0].value.to_sat()
+    );
     println!("raw tx         : {}", hex::encode(&raw));
 
     if !broadcast {
@@ -1408,8 +1416,7 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         }
         (None, None) => {
             return Err(
-                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow"
-                    .into(),
+                "provide --cold-skey, or --cold-vkey (+ --cold-sig) for the air-gapped flow".into(),
             );
         }
     };
@@ -1610,7 +1617,11 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
         "new identity root: {}",
         hex::encode(built.new_bifrost_identity_root)
     );
-    println!("membership token:  {}.{}", registry.hash_hex(), hex::encode(built.pool_id));
+    println!(
+        "membership token:  {}.{}",
+        registry.hash_hex(),
+        hex::encode(built.pool_id)
+    );
     println!("signed tx hex:\n{}", built.signed_tx_hex);
 
     if !args.submit {
@@ -1647,9 +1658,13 @@ fn run_show_roster(
         .as_deref()
         .ok_or("cardano.blockfrost_project_id required")?;
 
-    let source =
-        RegistryRosterSource::from_blueprint(&blueprint, &bootstrap, &nft_name, pid.starts_with("mainnet"))
-            .map_err(|e| e.to_string())?;
+    let source = RegistryRosterSource::from_blueprint(
+        &blueprint,
+        &bootstrap,
+        &nft_name,
+        pid.starts_with("mainnet"),
+    )
+    .map_err(|e| e.to_string())?;
     println!("registry policy:   {}", source.registry_policy_hex);
     println!("registry address:  {}", source.registry_address);
     println!("treasury_info:     {}", source.treasury_info_address);
@@ -1706,11 +1721,22 @@ fn run_show_roster(
     // ── ban list (WI-011) — informational; the eligible roster subtracts
     // active bans in WI-012 ──
     use heimdall::cardano::ban_list::{BanListError, BanListSource};
-    match BanListSource::from_config(&cfg.cardano) {
-        Ok(None) => {
+    // Derive from the SAME resolved blueprint/registry-bootstrap the roster
+    // section used (the ban policy is parameterized by the registry policy),
+    // so a --blueprint/--registry-bootstrap override can't make the two
+    // sections describe different deployments. ban_bootstrap is config-only.
+    match cfg.cardano.ban_bootstrap.as_deref() {
+        None => {
             println!("ban list:          (not configured — set cardano.ban_bootstrap)");
         }
-        Ok(Some(source)) => {
+        Some(ban_bootstrap) => {
+            let source = BanListSource::from_blueprint(
+                &blueprint,
+                &bootstrap,
+                ban_bootstrap,
+                pid.starts_with("mainnet"),
+            )
+            .map_err(|e| e.to_string())?;
             println!("ban policy:        {}", source.ban_policy_hex);
             println!("ban address:       {}", source.ban_address);
             match rt.block_on(source.fetch_ban_list(&base_url, pid)) {
@@ -1740,7 +1766,6 @@ fn run_show_roster(
                 Err(e) => return Err(format!("ban list: {e}")),
             }
         }
-        Err(e) => return Err(e.to_string()),
     }
     Ok(())
 }
@@ -1773,15 +1798,15 @@ fn run_sweep_pegins(
     use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
     use heimdall::bitcoin::taproot::treasury_spend_info;
     use heimdall::bitcoin::tm_builder::{
-        build_tm, sign_tm_single_key, PegInInput, PegOutRequest, TreasuryInput,
+        PegInInput, PegOutRequest, TreasuryInput, build_tm, sign_tm_single_key,
     };
     use heimdall::cardano::bf_http;
-    use heimdall::cardano::pegout_datum::fetch_pegout_requests;
     use heimdall::cardano::blockfrost_source::BlockfrostPegInSource;
     use heimdall::cardano::btc_rpc::broadcast_btc_tx;
     use heimdall::cardano::pallas_source::{NetworkMagic, PallasPegInSource};
     use heimdall::cardano::pegin_datum::parse_pegin_request;
     use heimdall::cardano::pegin_source::CardanoPegInSource;
+    use heimdall::cardano::pegout_datum::fetch_pegout_requests;
 
     let secp = Secp256k1::new();
     let (sk, y_fed) = y_fed_keypair(&secp, cfg)?;
@@ -1818,7 +1843,10 @@ fn run_sweep_pegins(
     let reqs = rt
         .block_on(source.query_pegin_requests(&policy_id))
         .map_err(|e| format!("query_pegin_requests: {e}"))?;
-    println!("scanned {} peg-in request(s) at {pegin_script_address}", reqs.len());
+    println!(
+        "scanned {} peg-in request(s) at {pegin_script_address}",
+        reqs.len()
+    );
 
     // Each parse reconstructs and matches the peg-in P2TR, so the returned
     // `spend_info` is itself proof the spend info matches the on-chain
@@ -1928,8 +1956,8 @@ fn run_sweep_pegins(
         ));
     }
 
-    let signed = sign_tm_single_key(&secp, &unsigned, &sk)
-        .map_err(|e| format!("sign sweep: {e}"))?;
+    let signed =
+        sign_tm_single_key(&secp, &unsigned, &sk).map_err(|e| format!("sign sweep: {e}"))?;
     let local_raw = bitcoin::consensus::encode::serialize(&signed);
     // If an existing-on-Bitcoin TM is provided, the effective tx posted to Cardano is THAT one,
     // not the locally-built one. Deserialize it so every subsequent print (txid, inputs, outputs)
@@ -1938,11 +1966,9 @@ fn run_sweep_pegins(
     let (effective_tx, raw, override_in_effect): (Transaction, Vec<u8>, bool) =
         if let Some(hex_str) = existing_tm_hex {
             let trimmed = hex_str.trim();
-            let bytes = hex::decode(trimmed)
-                .map_err(|e| format!("existing_tm_hex: {e}"))?;
-            let tx: Transaction = bitcoin::consensus::deserialize(&bytes).map_err(|e| {
-                format!("existing_tm_hex: not a valid Bitcoin transaction: {e}")
-            })?;
+            let bytes = hex::decode(trimmed).map_err(|e| format!("existing_tm_hex: {e}"))?;
+            let tx: Transaction = bitcoin::consensus::deserialize(&bytes)
+                .map_err(|e| format!("existing_tm_hex: not a valid Bitcoin transaction: {e}"))?;
             // Slice into `trimmed` (not the un-trimmed `hex_str`) — otherwise leading/trailing
             // whitespace makes `hex_str.len()` bigger than `trimmed.len()` and the slice panics.
             let preview_end = trimmed.len().min(20);
@@ -1996,7 +2022,11 @@ fn run_sweep_pegins(
             );
         }
     } else {
-        for (i, (inp, prevout)) in effective_tx.input.iter().zip(unsigned.prevouts.iter()).enumerate()
+        for (i, (inp, prevout)) in effective_tx
+            .input
+            .iter()
+            .zip(unsigned.prevouts.iter())
+            .enumerate()
         {
             println!(
                 "    [{}] {}:{} — {} sat  script={}",
@@ -2045,7 +2075,9 @@ fn run_sweep_pegins(
             .treasury_address
             .clone()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "cardano.treasury_address must be set (the TM validator address)".to_string())?;
+            .ok_or_else(|| {
+                "cardano.treasury_address must be set (the TM validator address)".to_string()
+            })?;
         let treasury_policy_id = cfg.cardano.treasury_policy_id.clone().unwrap_or_default();
         let treasury_asset_name_hex = cfg
             .cardano
@@ -2137,8 +2169,7 @@ fn print_bootstrap_treasury(cfg: &HeimdallConfig) {
     let spend_info = treasury_spend_info(&secp, y_fed, y_fed, csv_blocks);
     let output_key = spend_info.output_key();
     let script_pubkey = ScriptBuf::new_p2tr_tweaked(output_key);
-    let address = Address::from_script(&script_pubkey, network)
-        .expect("valid P2TR address");
+    let address = Address::from_script(&script_pubkey, network).expect("valid P2TR address");
 
     println!("{address}");
 }
@@ -2157,11 +2188,18 @@ fn print_frost_treasury(cfg: &HeimdallConfig, frost_key_hex: Option<&str>) {
 
     let hex_str = frost_key_hex.expect("--frost-key <32-byte-hex> is required");
     let bytes: Vec<u8> = hex::decode(hex_str).expect("--frost-key must be valid hex");
-    assert_eq!(bytes.len(), 32, "--frost-key must be 32 bytes (x-only pubkey)");
+    assert_eq!(
+        bytes.len(),
+        32,
+        "--frost-key must be 32 bytes (x-only pubkey)"
+    );
     let group_key = UntweakedPublicKey::from_slice(&bytes)
         .expect("--frost-key must be a valid secp256k1 x-only pubkey");
 
-    println!("FROST group key (x-only): {}", hex::encode(group_key.serialize()));
+    println!(
+        "FROST group key (x-only): {}",
+        hex::encode(group_key.serialize())
+    );
 
     // Y_fed = Y_51 = FROST group key
     let spend_info = treasury_spend_info(&secp, group_key, group_key, csv_blocks);
@@ -2179,7 +2217,7 @@ fn run_proof_demo(min_signers: u16, max_signers: u16) {
     use rand::rngs::OsRng;
 
     use heimdall::circuits::commitment::{CommitmentCheckWitness, CommitmentMisbehaviorCircuit};
-    use heimdall::circuits::signature::{SignatureShareCheckWitness, SignatureMisbehaviorCircuit};
+    use heimdall::circuits::signature::{SignatureMisbehaviorCircuit, SignatureShareCheckWitness};
     use heimdall::frost::{dkg, signing};
     use heimdall::gadgets::nonnative::bytes_to_limbs;
 
@@ -2225,10 +2263,7 @@ fn run_proof_demo(min_signers: u16, max_signers: u16) {
     let sig_bytes = sign_result.signature.serialize().unwrap();
     println!("  Signing completed in {sign_elapsed:.2?}");
     println!("  Signature: {}", hex::encode(&sig_bytes));
-    println!(
-        "  Message: \"{}\"",
-        std::str::from_utf8(message).unwrap()
-    );
+    println!("  Message: \"{}\"", std::str::from_utf8(message).unwrap());
     println!();
 
     // --- Step 3: Cheating signing ---
@@ -2444,7 +2479,10 @@ fn run_proof_demo(min_signers: u16, max_signers: u16) {
     println!("    PP setup:                  {sig_pp_elapsed:.2?}");
     println!("    Circuit compilation:       {sig_compile_elapsed:.2?}");
     println!("    Proof generation:          {sig_prove_elapsed:.2?}");
-    println!("    Proof size:                {} bytes", sig_proof_bytes.len());
+    println!(
+        "    Proof size:                {} bytes",
+        sig_proof_bytes.len()
+    );
     println!(
         "    Public inputs:             {} field elements",
         sig_public_inputs.len()

@@ -36,6 +36,17 @@ pub fn find_policy_nft_utxos(
     utxos: &[BfUtxo],
     policy_id_hex: &str,
 ) -> Result<Vec<NftUtxo>, String> {
+    // A policy id is a 28-byte script hash = 56 lowercase hex chars. Matching
+    // units by `strip_prefix(policy_id_hex)` only equals policy-equality at
+    // that exact length; a short/empty prefix would split foreign units
+    // mid-policy and misread the remainder as an asset name. Callers pass
+    // ParameterizedScript::hash_hex() (always 56), but guard the pub API.
+    if policy_id_hex.len() != 56 || !policy_id_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "policy id must be 56 hex chars (28-byte script hash), got {:?}",
+            policy_id_hex
+        ));
+    }
     let mut out = Vec::new();
     for u in utxos {
         let at = |what: &str| format!("{}#{}: {what}", u.tx_hash, u.output_index);

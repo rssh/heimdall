@@ -39,13 +39,6 @@ use crate::epoch::state::{Roster, SpoInfo};
 /// FROST with an opaque `InvalidMinSigners`.
 pub const FROST_MIN_PARTICIPANTS: u16 = 2;
 
-/// Backoff schedule for [`RegistryRosterSource::fetch_snapshot`] retries
-/// (attempts = delays + 1). Epoch-scale timing tolerates seconds of latency.
-const SNAPSHOT_RETRY_DELAYS: [std::time::Duration; 2] = [
-    std::time::Duration::from_secs(2),
-    std::time::Duration::from_secs(5),
-];
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -138,13 +131,22 @@ impl RosterError {
     /// Whether a re-read can plausibly clear the error. Network failures
     /// are transient; so are the inconsistencies a tx confirming mid-read
     /// can cause — a root mismatch between the two address fetches, or a
-    /// torn paginated list (broken links / missing root). Everything else
-    /// (corrupt datums, duplicate keys, bad config) is persistent state.
+    /// torn paginated list whose chain links no longer resolve. Everything
+    /// else is persistent state: corrupt datums, duplicate keys, bad config,
+    /// and crucially `MissingRoot` — an unbootstrapped or wrong-address
+    /// registry returns an empty UTxO set, which is a steady-state
+    /// misconfiguration, not a tear, and must NOT burn the retry budget.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::Fetch(_) | Self::RootMismatch { .. } | Self::List(_)
+            Self::Fetch(_)
+                | Self::RootMismatch { .. }
+                | Self::List(
+                    RegistryError::BrokenLink(_)
+                        | RegistryError::NotAscending(_)
+                        | RegistryError::UnreachableNodes(_)
+                )
         )
     }
 }
@@ -251,9 +253,17 @@ pub fn registry_snapshot(
 }
 
 /// Shape-check one registered `bifrost_url` (already UTF-8, trailing slashes
-/// trimmed): peers join `"{url}/dkg/..."` onto it verbatim, so it must be an
-/// absolute http(s) base URL without query or fragment.
-fn validate_bifrost_url(url: &str) -> Result<(), String> {
+/// Validate one registered `bifrost_url` and return its CANONICAL form.
+///
+/// Peers join `"{url}/dkg/..."` onto it verbatim and both the dedup check
+/// and `port_from_url` key off it, so we must validate AND canonicalize, not
+/// just check. The canonical form is `url::Url`'s normalized serialization
+/// (scheme + host lowercased, default ports elided) with the trailing slash
+/// trimmed — so `http://H:80` and `http://h` collapse to one string and a
+/// stray trailing space can't survive into a malformed fetch URL. Rejects
+/// non-http(s) schemes, missing host, query/fragment, and userinfo
+/// (credentials have no place in a public endpoint).
+fn validate_bifrost_url(url: &str) -> Result<String, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("not a valid URL: {e}"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!(
@@ -267,17 +277,21 @@ fn validate_bifrost_url(url: &str) -> Result<(), String> {
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err("query/fragment not allowed in a base URL".into());
     }
-    Ok(())
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("userinfo (credentials) not allowed".into());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 /// Derive the epoch [`Roster`] from a verified snapshot.
 ///
 /// Participants are ordered lexicographically by `bifrost_id_pk` and given
 /// FROST identifiers `1..=n` in that order — the spec's canonical DKG
-/// participant ordering. Each `bifrost_url` is normalized (trailing slashes
-/// trimmed) and validated as an http(s) base URL, and must be unique across
-/// the roster; a bad registration fails here, loudly naming the pool, rather
-/// than as an undiagnosable DKG poll timeout.
+/// participant ordering. Each `bifrost_url` is canonicalized + validated as
+/// an http(s) base URL (see [`validate_bifrost_url`]) and must be unique
+/// across the roster *after canonicalization* (so case- and default-port
+/// variants of one endpoint still collide); a bad registration fails here,
+/// loudly naming the pool, rather than as an undiagnosable DKG poll timeout.
 ///
 /// `min_signers` is the caller's override and must lie in
 /// `[`[`FROST_MIN_PARTICIPANTS`]`, max_signers]` — out-of-range values are
@@ -311,11 +325,10 @@ pub fn roster_from_snapshot(
             pool_id: spo.pool_id.clone(),
             reason,
         };
-        let bifrost_url = String::from_utf8(spo.bifrost_url.clone())
-            .map_err(|_| bad_url("not valid UTF-8".into()))?
-            .trim_end_matches('/')
-            .to_string();
-        validate_bifrost_url(&bifrost_url).map_err(bad_url)?;
+        let raw =
+            std::str::from_utf8(&spo.bifrost_url).map_err(|_| bad_url("not valid UTF-8".into()))?;
+        // Canonical form for both dedup and storage — see validate_bifrost_url.
+        let bifrost_url = validate_bifrost_url(raw).map_err(bad_url)?;
         if !seen_urls.insert(bifrost_url.clone()) {
             return Err(RosterError::DuplicateUrl { url: bifrost_url });
         }
@@ -488,31 +501,23 @@ impl RegistryRosterSource {
         base_url: &str,
         project_id: &str,
     ) -> Result<RegistrySnapshot, RosterError> {
-        let mut delays = SNAPSHOT_RETRY_DELAYS.iter();
-        loop {
-            let result = fetch_registry_snapshot(
-                base_url,
-                project_id,
-                &self.registry_address,
-                &self.registry_policy_hex,
-                &self.treasury_info_address,
-                &self.treasury_info_policy_hex,
-                &self.treasury_info_asset_name_hex,
-            )
-            .await;
-            match result {
-                Err(e) if e.is_transient() => match delays.next() {
-                    Some(delay) => {
-                        eprintln!(
-                            "[roster] transient snapshot failure: {e} — retrying in {delay:?}"
-                        );
-                        tokio::time::sleep(*delay).await;
-                    }
-                    None => return Err(e),
-                },
-                other => return other,
-            }
-        }
+        crate::cardano::retry::retry_transient(
+            &crate::cardano::retry::DEFAULT_DELAYS,
+            "roster",
+            RosterError::is_transient,
+            || {
+                fetch_registry_snapshot(
+                    base_url,
+                    project_id,
+                    &self.registry_address,
+                    &self.registry_policy_hex,
+                    &self.treasury_info_address,
+                    &self.treasury_info_policy_hex,
+                    &self.treasury_info_asset_name_hex,
+                )
+            },
+        )
+        .await
     }
 
     /// Fetch + verify the snapshot (with retry) and derive the roster for
@@ -866,6 +871,27 @@ mod tests {
         ));
     }
 
+    // Canonicalization must catch endpoints that differ only in host case or
+    // an elided default port — otherwise the byte-exact dedup is bypassed and
+    // the collision the check exists to prevent still happens.
+    #[test]
+    fn roster_dedups_url_case_and_default_port() {
+        // first SPO uses host-lowercase, second the SAME host upper-cased
+        let mut spos = spos_with_url(b"http://SPO-A.EXAMPLE:18500");
+        spos[0].url = b"http://spo-a.example:18500";
+        assert!(matches!(
+            roster_from_snapshot(&snapshot_of(&spos).unwrap(), 0, None),
+            Err(RosterError::DuplicateUrl { .. })
+        ));
+        // default port elision: "http://h:80" == "http://h"
+        let mut spos = spos_with_url(b"http://spo-a.example");
+        spos[0].url = b"http://spo-a.example:80";
+        assert!(matches!(
+            roster_from_snapshot(&snapshot_of(&spos).unwrap(), 0, None),
+            Err(RosterError::DuplicateUrl { .. })
+        ));
+    }
+
     #[test]
     fn transient_errors_are_classified() {
         assert!(RosterError::Fetch("http 500".into()).is_transient());
@@ -876,7 +902,10 @@ mod tests {
             }
             .is_transient()
         );
-        assert!(RosterError::List(RegistryError::MissingRoot).is_transient());
+        // torn-read list shapes retry; an empty/wrong-address registry
+        // (MissingRoot) is steady-state and must NOT burn the retry budget.
+        assert!(RosterError::List(RegistryError::BrokenLink(vec![1])).is_transient());
+        assert!(!RosterError::List(RegistryError::MissingRoot).is_transient());
         assert!(!RosterError::TooFew { got: 1 }.is_transient());
         assert!(!RosterError::DuplicateIdPk(vec![1]).is_transient());
         assert!(!RosterError::Config("x".into()).is_transient());

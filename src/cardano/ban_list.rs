@@ -53,7 +53,10 @@ const MAX_NODE_KEY_LEN: usize = 32 - BAN_NODE_KEY_PREFIX.len();
 pub struct BanNodeData {
     /// How many times this pool has been banned (>= 1, validator-enforced).
     pub ban_counter: i64,
-    /// Last epoch for which the ban is active: active iff `> epoch`.
+    /// Epoch at which the ban EXPIRES: active iff `ban_until_epoch > epoch`
+    /// (so the last actively-banned epoch is `ban_until_epoch - 1`). A first
+    /// ban sets `current_epoch + 1` (spo-bans.ak), i.e. active for the
+    /// current epoch only.
     pub ban_until_epoch: i64,
 }
 
@@ -550,16 +553,27 @@ impl BanListSource {
         Self::from_blueprint(blueprint_path, registry_bootstrap, ban_bootstrap, mainnet).map(Some)
     }
 
-    /// Fetch the ban-list UTxOs and build the validated snapshot.
+    /// Fetch the ban-list UTxOs and build the validated snapshot, retrying
+    /// transient failures (network blips, torn paginated reads) so a ban tx
+    /// confirming mid-read doesn't fail the whole roster derivation — the
+    /// same absorption [`RegistryRosterSource::fetch_snapshot`] gets.
     pub async fn fetch_ban_list(
         &self,
         base_url: &str,
         project_id: &str,
     ) -> Result<BanList, BanListError> {
-        let utxos = bf_http::fetch_address_utxos(base_url, project_id, &self.ban_address)
-            .await
-            .map_err(BanListError::Fetch)?;
-        ban_snapshot(&utxos, &self.ban_policy_hex)
+        crate::cardano::retry::retry_transient(
+            &crate::cardano::retry::DEFAULT_DELAYS,
+            "ban-list",
+            BanListError::is_transient,
+            || async {
+                let utxos = bf_http::fetch_address_utxos(base_url, project_id, &self.ban_address)
+                    .await
+                    .map_err(BanListError::Fetch)?;
+                ban_snapshot(&utxos, &self.ban_policy_hex)
+            },
+        )
+        .await
     }
 }
 
