@@ -1702,6 +1702,46 @@ fn run_show_roster(
         }
         Err(e) => return Err(e.to_string()),
     }
+
+    // ── ban list (WI-011) — informational; the eligible roster subtracts
+    // active bans in WI-012 ──
+    use heimdall::cardano::ban_list::{BanListError, BanListSource};
+    match BanListSource::from_config(&cfg.cardano) {
+        Ok(None) => {
+            println!("ban list:          (not configured — set cardano.ban_bootstrap)");
+        }
+        Ok(Some(source)) => {
+            println!("ban policy:        {}", source.ban_policy_hex);
+            println!("ban address:       {}", source.ban_address);
+            match rt.block_on(source.fetch_ban_list(&base_url, pid)) {
+                Ok(bans) => {
+                    println!(
+                        "ban entries:       {} ({} active for epoch {epoch})",
+                        bans.len(),
+                        bans.active_bans(epoch).len()
+                    );
+                    for (pool_id, data) in bans.iter() {
+                        let state = if data.active_for(epoch) {
+                            "ACTIVE"
+                        } else {
+                            "expired"
+                        };
+                        println!(
+                            "  pool {}  counter={} until_epoch={} [{state}]",
+                            hex::encode(pool_id),
+                            data.ban_counter,
+                            data.ban_until_epoch
+                        );
+                    }
+                }
+                // Expected until the ban root is minted (WI-015) — report,
+                // don't fail the read-only diagnostic.
+                Err(e @ BanListError::NotBootstrapped) => println!("ban list:          {e}"),
+                Err(e) => return Err(format!("ban list: {e}")),
+            }
+        }
+        Err(e) => return Err(e.to_string()),
+    }
     Ok(())
 }
 

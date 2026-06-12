@@ -395,8 +395,9 @@ pub struct RegistryRosterSource {
     pub min_signers: Option<u16>,
 }
 
-/// Parse `<cardano_tx_hash>:<index>` (the registry bootstrap outref form).
-fn parse_outref(s: &str) -> Result<([u8; 32], u32), String> {
+/// Parse `<cardano_tx_hash>:<index>` (the one-shot bootstrap outref form
+/// shared by the registry and ban-list sources).
+pub fn parse_outref(s: &str) -> Result<([u8; 32], u32), String> {
     let (h, i) = s
         .split_once(':')
         .ok_or_else(|| format!("expected <tx_hash>:<index>, got '{s}'"))?;

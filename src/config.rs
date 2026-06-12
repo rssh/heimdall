@@ -174,6 +174,11 @@ pub struct CardanoConfig {
     /// Identifies the `treasury_info` state UTxO whose
     /// `bifrost_identity_root` the registry snapshot is verified against.
     pub treasury_info_asset_name: Option<String>,
+    /// The spo_bans one-shot bootstrap outref `<tx_hash>:<index>` that
+    /// parameterizes the ban-list policy (the policy is also parameterized
+    /// by the registry policy, so `registry_blueprint` + `registry_bootstrap`
+    /// must be set alongside). Unset → the ban list is not read.
+    pub ban_bootstrap: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -197,6 +202,7 @@ impl Default for CardanoConfig {
             registry_blueprint: None,
             registry_bootstrap: None,
             treasury_info_asset_name: None,
+            ban_bootstrap: None,
         }
     }
 }

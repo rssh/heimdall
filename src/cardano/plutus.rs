@@ -82,6 +82,8 @@ pub enum PlutusError {
     MissingField(usize),
     /// Field at index `usize` is not a `ByteArray`.
     NotBytes(usize),
+    /// Field at index `usize` is not an `Int` (or exceeds `i64`).
+    NotInt(usize),
 }
 
 impl std::fmt::Display for PlutusError {
@@ -93,6 +95,7 @@ impl std::fmt::Display for PlutusError {
             }
             Self::MissingField(i) => write!(f, "missing field [{i}]"),
             Self::NotBytes(i) => write!(f, "field [{i}] is not a ByteArray"),
+            Self::NotInt(i) => write!(f, "field [{i}] is not an Int (or exceeds i64)"),
         }
     }
 }
@@ -132,6 +135,19 @@ pub fn field_bytes(fields: &[PlutusData], i: usize) -> Result<Vec<u8>, PlutusErr
     match fields.get(i) {
         Some(PlutusData::BoundedBytes(b)) => Ok(b.clone().into()),
         Some(_) => Err(PlutusError::NotBytes(i)),
+        None => Err(PlutusError::MissingField(i)),
+    }
+}
+
+/// The `Int` field at index `i`. On-chain Ints are unbounded; anything
+/// outside `i64` (including the big-integer CBOR forms) is rejected rather
+/// than truncated — no bifrost datum legitimately carries such values.
+pub fn field_int(fields: &[PlutusData], i: usize) -> Result<i64, PlutusError> {
+    match fields.get(i) {
+        Some(PlutusData::BigInt(BigInt::Int(n))) => {
+            i64::try_from(i128::from(*n)).map_err(|_| PlutusError::NotInt(i))
+        }
+        Some(PlutusData::BigInt(_)) | Some(_) => Err(PlutusError::NotInt(i)),
         None => Err(PlutusError::MissingField(i)),
     }
 }
