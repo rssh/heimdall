@@ -40,6 +40,11 @@ pub struct BlockfrostCardanoChain {
     treasury_config: TreasuryConfig,
     /// Fallback roster.
     fallback_roster: Roster,
+    /// On-chain SPO registry source. When set, `query_roster` reads the
+    /// real registry (verified against the `treasury_info` identity root)
+    /// and any failure is a hard error — it never silently falls back to
+    /// `fallback_roster`, which would let SPOs run DKG on divergent rosters.
+    registry_roster: Option<crate::cardano::roster::RegistryRosterSource>,
     /// Mnemonic-derived payment key for the Cardano wallet that pays
     /// fees. `None` means publishing is disabled (dry run).
     payment_key: Option<PrivateKey>,
@@ -97,6 +102,7 @@ impl BlockfrostCardanoChain {
             treasury_asset_name_hex: treasury_asset_name_hex.into(),
             treasury_config,
             fallback_roster,
+            registry_roster: None,
             payment_key: None,
             wallet_base_address: None,
             treasury_y_51: Mutex::new(None),
@@ -120,6 +126,16 @@ impl BlockfrostCardanoChain {
     ) -> Self {
         self.tm_script_cbor = Some(script_cbor.to_string());
         self.tm_control_ref = Some((control_tx_hash.to_string(), control_index));
+        self
+    }
+
+    /// Read the roster from the on-chain SPO registry instead of the
+    /// fallback fixture (WI-010).
+    pub fn with_registry_roster(
+        mut self,
+        source: crate::cardano::roster::RegistryRosterSource,
+    ) -> Self {
+        self.registry_roster = Some(source);
         self
     }
 
@@ -191,8 +207,14 @@ impl CardanoChain for BlockfrostCardanoChain {
         Ok(EpochBoundaryEvent { epoch: 0 })
     }
 
-    async fn query_roster(&self, _epoch: u64) -> EpochResult<Roster> {
-        Ok(self.fallback_roster.clone())
+    async fn query_roster(&self, epoch: u64) -> EpochResult<Roster> {
+        match &self.registry_roster {
+            Some(source) => source
+                .fetch_roster(&self.bf_base_url, &self.bf_project_id, epoch)
+                .await
+                .map_err(|e| EpochError::Chain(format!("on-chain roster: {e}"))),
+            None => Ok(self.fallback_roster.clone()),
+        }
     }
 
     async fn query_treasury(&self) -> EpochResult<TreasuryUtxo> {

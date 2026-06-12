@@ -162,6 +162,18 @@ pub struct CardanoConfig {
     /// The TM-control UTxO outpoint `<tx_hash>#<index>` to reference (carries the authorized-minter
     /// datum). Required alongside `tm_script_cbor`.
     pub tm_control_ref: Option<String>,
+    /// Path to the bifrost Aiken blueprint (plutus.json) holding the compiled
+    /// spos_registry + treasury_info validators. Together with
+    /// `registry_bootstrap` and `treasury_info_asset_name` this switches
+    /// `query_roster` from the demo fixture to the on-chain SPO registry.
+    pub registry_blueprint: Option<String>,
+    /// The spos_registry one-shot bootstrap outref `<tx_hash>:<index>` that
+    /// parameterizes the registry policy (and through it treasury_info).
+    pub registry_bootstrap: Option<String>,
+    /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+    /// Identifies the `treasury_info` state UTxO whose
+    /// `bifrost_identity_root` the registry snapshot is verified against.
+    pub treasury_info_asset_name: Option<String>,
 }
 
 impl Default for CardanoConfig {
@@ -182,6 +194,9 @@ impl Default for CardanoConfig {
             oracle_constructor: 0,
             tm_script_cbor: None,
             tm_control_ref: None,
+            registry_blueprint: None,
+            registry_bootstrap: None,
+            treasury_info_asset_name: None,
         }
     }
 }

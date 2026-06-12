@@ -285,6 +285,26 @@ enum Commands {
         #[arg(long)]
         submit: bool,
     },
+    /// Read + verify the on-chain SPO registry and print the DKG roster:
+    /// reconstructs the spos_registry linked list, cross-checks the rebuilt
+    /// identity-trie root against the treasury_info datum, and orders
+    /// participants by bifrost_id_pk. Read-only.
+    ShowRoster {
+        #[arg(long)]
+        config: Option<String>,
+        /// Path to the bifrost Aiken blueprint (plutus.json). Falls back to
+        /// cardano.registry_blueprint.
+        #[arg(long)]
+        blueprint: Option<String>,
+        /// The spos_registry one-shot bootstrap outref (<tx_hash>:<index>).
+        /// Falls back to cardano.registry_bootstrap.
+        #[arg(long)]
+        registry_bootstrap: Option<String>,
+        /// Treasury NFT asset name (hex), as printed by bootstrap-treasury-info.
+        /// Falls back to cardano.treasury_info_asset_name.
+        #[arg(long)]
+        treasury_nft_name: Option<String>,
+    },
     /// Scan binocular's on-chain peg-in requests over N2C, then build → sign →
     /// (optionally) broadcast the Treasury Movement sweeping the treasury + all
     /// discovered deposits into a new treasury output[0]. Key-path spend signed
@@ -555,6 +575,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::ShowRoster {
+            config,
+            blueprint,
+            registry_bootstrap,
+            treasury_nft_name,
+        } => {
+            let cfg = load_config(config.as_deref());
+            if let Err(e) = run_show_roster(&cfg, blueprint, registry_bootstrap, treasury_nft_name)
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Commands::SweepPegins {
             config,
             cardano_socket,
@@ -686,6 +719,19 @@ async fn run_demo(cfg: HeimdallConfig, index: u16, deterministic: bool) {
             cfg.cardano.submit_oracle,
             cfg.cardano.oracle_constructor,
         );
+
+        // On-chain SPO registry roster (WI-010): configured via
+        // cardano.{registry_blueprint, registry_bootstrap, treasury_info_asset_name}.
+        // Without it query_roster serves the fixture roster.
+        match heimdall::cardano::roster::RegistryRosterSource::from_config(&cfg.cardano) {
+            Ok(Some(source)) => {
+                println!("on-chain SPO registry: {}", source.registry_address);
+                bf_chain = bf_chain.with_registry_roster(source);
+            }
+            Ok(None) => {}
+            Err(e) => panic!("registry roster config: {e}"),
+        }
+
         let bf_chain = apply_tm_policy(bf_chain, &cfg).expect("invalid TM policy config");
 
         chain = Arc::new(bf_chain);
@@ -1560,6 +1606,97 @@ fn run_register_spo(cfg: &HeimdallConfig, args: &RegisterSpoArgs) -> Result<(), 
     }
     let tx_hash = submit_tx_blockfrost(cfg, pid, &built.signed_tx_hex, &rt)?;
     println!("submitted: tx_hash={tx_hash}");
+    Ok(())
+}
+
+/// Read + verify the on-chain SPO registry and print the DKG roster (WI-010).
+fn run_show_roster(
+    cfg: &HeimdallConfig,
+    blueprint: Option<String>,
+    registry_bootstrap: Option<String>,
+    treasury_nft_name: Option<String>,
+) -> Result<(), String> {
+    use heimdall::cardano::bf_http;
+    use heimdall::cardano::roster::{
+        RegistryRosterSource, RosterError, fetch_registry_snapshot, roster_from_snapshot,
+    };
+
+    let blueprint = blueprint
+        .or_else(|| cfg.cardano.registry_blueprint.clone())
+        .ok_or("--blueprint (or cardano.registry_blueprint) required")?;
+    let bootstrap = registry_bootstrap
+        .or_else(|| cfg.cardano.registry_bootstrap.clone())
+        .ok_or("--registry-bootstrap (or cardano.registry_bootstrap) required")?;
+    let nft_name = treasury_nft_name
+        .or_else(|| cfg.cardano.treasury_info_asset_name.clone())
+        .ok_or("--treasury-nft-name (or cardano.treasury_info_asset_name) required")?;
+    let pid = cfg
+        .cardano
+        .blockfrost_project_id
+        .as_deref()
+        .ok_or("cardano.blockfrost_project_id required")?;
+
+    let source =
+        RegistryRosterSource::from_blueprint(&blueprint, &bootstrap, &nft_name, pid.starts_with("mainnet"))
+            .map_err(|e| e.to_string())?;
+    println!("registry policy:   {}", source.registry_policy_hex);
+    println!("registry address:  {}", source.registry_address);
+    println!("treasury_info:     {}", source.treasury_info_address);
+
+    let base_url = bf_http::base_url(pid, cfg.cardano.blockfrost_url.as_deref());
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let epoch = rt.block_on(bf_http::fetch_current_epoch(&base_url, pid))?;
+    let snapshot = rt
+        .block_on(fetch_registry_snapshot(
+            &base_url,
+            pid,
+            &source.registry_address,
+            &source.registry_policy_hex,
+            &source.treasury_info_address,
+            &source.treasury_info_policy_hex,
+            &source.treasury_info_asset_name_hex,
+        ))
+        .map_err(|e| e.to_string())?;
+
+    println!("current epoch:     {epoch}");
+    println!(
+        "identity root:     {} (verified against treasury_info)",
+        hex::encode(snapshot.identity_root)
+    );
+    println!("registered SPOs:   {}", snapshot.spos.len());
+    for spo in &snapshot.spos {
+        let pool: [u8; 28] = spo
+            .pool_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("pool_id not 28 bytes: {}", hex::encode(&spo.pool_id)))?;
+        println!("  pool {} ({})", hex::encode(pool), pool_id_bech32(&pool));
+        println!("    bifrost_id_pk: {}", hex::encode(&spo.bifrost_id_pk));
+        println!(
+            "    bifrost_url:   {}",
+            String::from_utf8_lossy(&spo.bifrost_url)
+        );
+        println!("    element UTxO:  {}:{}", spo.tx_hash, spo.output_index);
+    }
+
+    match roster_from_snapshot(&snapshot, epoch, None) {
+        Ok(roster) => {
+            println!(
+                "DKG roster (ordered by bifrost_id_pk; min_signers={} of {}):",
+                roster.min_signers, roster.max_signers
+            );
+            for (i, info) in roster.participants.values().enumerate() {
+                println!(
+                    "  #{:<3} pk {}  {}",
+                    i + 1,
+                    hex::encode(&info.bifrost_id_pk),
+                    info.bifrost_url
+                );
+            }
+        }
+        Err(RosterError::Empty) => println!("DKG roster:        (empty registry)"),
+        Err(e) => return Err(e.to_string()),
+    }
     Ok(())
 }
 
